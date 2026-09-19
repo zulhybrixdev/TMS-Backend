@@ -1,0 +1,12 @@
+node_modules/
+dist/
+
+# Env files - all tiers (.env, .env.production, .env.uat, .env.local, ...)
+# carry real DB credentials/JWT secrets. Only the checked-in template stays.
+# .env
+# .env.*
+# !.env.example
+
+*.log
+*.tsbuildinfo
+.DS_Store

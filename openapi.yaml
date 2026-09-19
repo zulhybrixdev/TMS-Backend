@@ -1,0 +1,377 @@
+openapi: 3.0.3
+info:
+  title: Treasury Management System API
+  version: "1.0.0"
+  description: >
+    REST API for the TMS Phase 1 MVP - bank accounts, cash position,
+    payments, incoming transactions, inter-bank transfers, approvals,
+    cash forecasting, reports, administration, and audit logs.
+servers:
+  - url: /api
+security:
+  - bearerAuth: []
+tags:
+  - name: Auth
+  - name: Dashboard
+  - name: Bank Accounts
+  - name: Cash Position
+  - name: Payments
+  - name: Incoming Transactions
+  - name: Transfers
+  - name: Approvals
+  - name: Forecast
+  - name: Reports
+  - name: Administration
+  - name: Audit
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate and receive a JWT
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+        "401": { description: Invalid credentials }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current authenticated user, roles & permissions
+      responses:
+        "200": { description: OK }
+
+  /dashboard:
+    get:
+      tags: [Dashboard]
+      summary: Consolidated dashboard summary (cash, approvals, alerts, forecast)
+      responses:
+        "200": { description: OK }
+
+  /bank-accounts:
+    get:
+      tags: [Bank Accounts]
+      summary: List bank accounts with computed cash metrics
+      parameters:
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/pageSize"
+        - $ref: "#/components/parameters/search"
+        - in: query
+          name: bankId
+          schema: { type: string }
+        - in: query
+          name: currencyCode
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [Bank Accounts]
+      summary: Create a bank account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BankAccountInput" }
+      responses:
+        "201": { description: Created }
+
+  /bank-accounts/{id}:
+    get:
+      tags: [Bank Accounts]
+      summary: Get a bank account by id
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: OK }
+    patch:
+      tags: [Bank Accounts]
+      summary: Update an account, including minimum/target balance configuration
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: OK }
+
+  /bank-accounts/{id}/balance:
+    post:
+      tags: [Bank Accounts]
+      summary: Record a manual balance update for an account
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [balanceDate, closingBalance]
+              properties:
+                balanceDate: { type: string, format: date }
+                closingBalance: { type: number }
+                availableBalance: { type: number }
+      responses:
+        "200": { description: OK }
+
+  /cash-position:
+    get:
+      tags: [Cash Position]
+      summary: Consolidated cash position (by bank, by currency, recommendations)
+      responses:
+        "200": { description: OK }
+
+  /cash-position/history:
+    get:
+      tags: [Cash Position]
+      summary: Historical balances, daily/weekly/monthly
+      parameters:
+        - in: query
+          name: period
+          schema: { type: string, enum: [daily, weekly, monthly] }
+        - in: query
+          name: from
+          schema: { type: string, format: date }
+        - in: query
+          name: to
+          schema: { type: string, format: date }
+      responses:
+        "200": { description: OK }
+
+  /payments:
+    get:
+      tags: [Payments]
+      summary: List payments
+      parameters:
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/pageSize"
+        - $ref: "#/components/parameters/search"
+        - in: query
+          name: status
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [Payments]
+      summary: Create a draft payment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PaymentInput" }
+      responses:
+        "201": { description: Created }
+
+  /payments/{id}:
+    get:
+      tags: [Payments]
+      summary: Get a payment
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: OK }
+
+  /payments/{id}/submit:
+    post:
+      tags: [Payments]
+      summary: Submit a draft payment for approval
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: OK }
+
+  /payments/{id}/cancel:
+    post:
+      tags: [Payments]
+      summary: Cancel a draft or pending payment
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: OK }
+
+  /incoming-transactions:
+    get:
+      tags: [Incoming Transactions]
+      summary: List incoming transactions
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [Incoming Transactions]
+      summary: Record an expected incoming transaction
+      responses:
+        "201": { description: Created }
+
+  /incoming-transactions/{id}/receive:
+    post:
+      tags: [Incoming Transactions]
+      summary: Mark funds as received (posts ledger entry, updates cash position)
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: OK }
+
+  /transfers/recommendations:
+    get:
+      tags: [Transfers]
+      summary: System-generated transfer recommendations from the cash engine
+      responses:
+        "200": { description: OK }
+
+  /transfers:
+    get:
+      tags: [Transfers]
+      summary: List inter-bank transfers
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [Transfers]
+      summary: Create a draft transfer (validated against source minimum balance)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TransferInput" }
+      responses:
+        "201": { description: Created }
+
+  /transfers/{id}/submit:
+    post:
+      tags: [Transfers]
+      summary: Submit a draft transfer for approval
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: OK }
+
+  /approvals/pending:
+    get:
+      tags: [Approvals]
+      summary: Approval requests awaiting the current user's action
+      responses:
+        "200": { description: OK }
+
+  /approvals/{id}/act:
+    post:
+      tags: [Approvals]
+      summary: Approve or reject a request (enforces segregation of duties)
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [APPROVE, REJECT] }
+                comment: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /forecasts/projection:
+    get:
+      tags: [Forecast]
+      summary: Projected cash balance combining manual entries and live pipeline
+      parameters:
+        - in: query
+          name: from
+          schema: { type: string, format: date }
+        - in: query
+          name: to
+          schema: { type: string, format: date }
+      responses:
+        "200": { description: OK }
+
+  /reports/cash-position:
+    get:
+      tags: [Reports]
+      summary: Cash position report (add ?format=csv to export)
+      parameters:
+        - in: query
+          name: format
+          schema: { type: string, enum: [json, csv] }
+      responses:
+        "200": { description: OK }
+
+  /audit-logs:
+    get:
+      tags: [Audit]
+      summary: Query the audit trail
+      parameters:
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/pageSize"
+        - in: query
+          name: entityType
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    page:
+      name: page
+      in: query
+      schema: { type: integer, default: 1 }
+    pageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, default: 20 }
+    search:
+      name: search
+      in: query
+      schema: { type: string }
+  schemas:
+    ApiResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        data: {}
+    BankAccountInput:
+      type: object
+      required: [bankId, accountName, accountNumber, currencyCode]
+      properties:
+        bankId: { type: string }
+        accountName: { type: string }
+        accountNumber: { type: string }
+        currencyCode: { type: string }
+        accountType: { type: string, enum: [OPERATING, COLLECTION, DISBURSEMENT, RESERVE] }
+        currentBalance: { type: number }
+        minimumBalance: { type: number }
+        targetBalance: { type: number }
+    PaymentInput:
+      type: object
+      required: [beneficiaryName, beneficiaryAccount, beneficiaryBank, amount, currencyCode, sourceAccountId, paymentDate]
+      properties:
+        beneficiaryName: { type: string }
+        beneficiaryAccount: { type: string }
+        beneficiaryBank: { type: string }
+        amount: { type: number }
+        currencyCode: { type: string }
+        sourceAccountId: { type: string }
+        paymentDate: { type: string, format: date }
+        description: { type: string }
+    TransferInput:
+      type: object
+      required: [sourceAccountId, destinationAccountId, amount, currencyCode, transferDate]
+      properties:
+        sourceAccountId: { type: string }
+        destinationAccountId: { type: string }
+        amount: { type: number }
+        currencyCode: { type: string }
+        transferDate: { type: string, format: date }
+        reason: { type: string }

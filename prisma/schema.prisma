@@ -1,0 +1,1040 @@
+// Treasury System - Database Schema
+// MySQL via Prisma ORM
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider          = "mysql"
+  url               = env("DATABASE_URL")
+  // `tms` only has privileges on tms/tms_production/tms_shadow, not
+  // CREATE/DROP DATABASE generally, so `prisma migrate dev` needs an
+  // explicit, pre-created shadow database rather than the default of
+  // creating/dropping one on the fly.
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tenancy & Subscriptions (Platform Service)
+// ─────────────────────────────────────────────────────────────
+
+// Singleton row (always id "singleton") holding platform-wide switches.
+// pocMode flips the live server's redirect behaviour between the POC
+// build (/poc/*) and the full build (/) with no rebuild/redeploy - see
+// common/platform-config.service.ts and common/middleware/poc-mode.middleware.ts.
+model PlatformConfig {
+  id        String   @id @default("singleton")
+  pocMode   Boolean  @default(false) @map("poc_mode")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("platform_config")
+}
+
+// A platform-level operator account - deliberately NOT a tenant-scoped
+// User. It authenticates separately (see modules/platform/) and can only
+// see/manage tenant metadata (plan, status, usage) - never a tenant's own
+// treasury data (payments, balances, etc.).
+model PlatformAdmin {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("platform_admins")
+}
+
+model Tenant {
+  id          String            @id @default(cuid())
+  slug        String            @unique // e.g. "TEST" - used in registration/lookup
+  name        String
+  accountType TenantAccountType @default(TEAM) @map("account_type")
+  status      TenantStatus      @default(ACTIVE)
+  // Org-wide "require two-factor authentication" (Administration ->
+  // Security). Off by default; when on, a password login by a user without
+  // TOTP enabled is forced through enrollment before getting a session
+  // (auth.service.ts). SSO logins are exempt - the IdP owns MFA there.
+  mfaRequired Boolean           @default(false) @map("mfa_required")
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime          @updatedAt @map("updated_at")
+
+  subscription Subscription?
+  invoices     SubscriptionInvoice[]
+  ssoConfig    TenantSsoConfig?
+
+  users                User[]
+  roles                Role[]
+  banks                Bank[]
+  bankAccounts         BankAccount[]
+  accountBalances      AccountBalance[]
+  transactions         Transaction[]
+  payments             Payment[]
+  beneficiaries        Beneficiary[]
+  paymentTemplates     PaymentTemplate[]
+  incomingTransactions IncomingTransaction[]
+  transfers            Transfer[]
+  approvalRules        ApprovalRule[]
+  approvalRequests     ApprovalRequest[]
+  approvalActions      ApprovalAction[]
+  comments             Comment[]
+  reportDefinitions    ReportDefinition[]
+  cashForecasts        CashForecast[]
+  notifications        Notification[]
+  auditLogs            AuditLog[]
+  systemSettings       SystemSetting[]
+
+  @@map("tenants")
+}
+
+enum TenantAccountType {
+  INDIVIDUAL
+  TEAM
+  ENTERPRISE
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+model Subscription {
+  id                 String             @id @default(cuid())
+  tenantId           String             @unique @map("tenant_id")
+  planKey            PlanKey            @default(FREE) @map("plan_key")
+  status             SubscriptionStatus @default(ACTIVE)
+  currentPeriodStart DateTime?          @map("current_period_start")
+  currentPeriodEnd   DateTime?          @map("current_period_end")
+  cancelAtPeriodEnd  Boolean            @default(false) @map("cancel_at_period_end")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  tenant   Tenant                @relation(fields: [tenantId], references: [id])
+  invoices SubscriptionInvoice[]
+
+  @@map("subscriptions")
+}
+
+enum PlanKey {
+  FREE
+  PRO
+  PRO_PLUS
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  PENDING_PAYMENT
+}
+
+// One row per checkout attempt (registration or upgrade). Tracks the Fiuu
+// payment gateway lifecycle for a plan change.
+model SubscriptionInvoice {
+  id             String        @id @default(cuid())
+  tenantId       String        @map("tenant_id")
+  subscriptionId String        @map("subscription_id")
+  planKey        PlanKey       @map("plan_key")
+  amountMYR      Decimal       @map("amount_myr") @db.Decimal(10, 2)
+  status         InvoiceStatus @default(PENDING)
+  gateway        String        @default("fiuu")
+  gatewayOrderId String        @unique @map("gateway_order_id")
+  gatewayTranId  String?       @map("gateway_tran_id")
+  gatewayChannel String?       @map("gateway_channel")
+  rawPayload     Json?         @map("raw_payload")
+  paidAt         DateTime?     @map("paid_at")
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id])
+  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+
+  @@index([tenantId])
+  @@index([status])
+  @@map("subscription_invoices")
+}
+
+enum InvoiceStatus {
+  PENDING
+  PAID
+  FAILED
+}
+
+// One row per tenant that has opted into Keycloak SSO - its mere existence
+// is what gates the login flow (see sso.service.ts); creating one is
+// itself gated (Pro+ plan + accountType != INDIVIDUAL, enforced in
+// sso-config.service.ts, not here - Prisma has no cross-table check
+// constraints). keycloakIdpAlias is the Identity Provider alias this
+// tenant's admin registered in Keycloak for their own IdP (SAML/OIDC/Azure
+// AD/Okta) - Keycloak brokers it, this app never speaks that protocol
+// directly. ssoRequired, when on, blocks local password login for this
+// tenant's non-Admin users (auth.service.ts) - Admins keep password login
+// as a break-glass path.
+model TenantSsoConfig {
+  id                  String   @id @default(cuid())
+  tenantId            String   @unique @map("tenant_id")
+  keycloakIdpAlias    String   @map("keycloak_idp_alias")
+  ssoRequired         Boolean  @default(false) @map("sso_required")
+  autoProvisionUsers  Boolean  @default(true) @map("auto_provision_users")
+  // string[] of email domains SSO may sign in / provision (e.g.
+  // ["acme.com"]); null or empty = no restriction. Defence in depth on top
+  // of requiring a verified email: even a misconfigured IdP can't sign
+  // someone in as an address outside the domains this tenant owns.
+  allowedEmailDomains Json?    @map("allowed_email_domains")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("tenant_sso_configs")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Identity & Access (Common Service)
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id               String     @id @default(cuid())
+  tenantId         String     @map("tenant_id")
+  email            String     @unique
+  passwordHash     String     @map("password_hash")
+  name             String
+  jobTitle         String?    @map("job_title")
+  // Free-text cost center / department (e.g. "Finance", "Ops") - optional.
+  // Used by approval_rules.department to route by department in addition
+  // to entity type/currency/amount (see approval-rules.service.ts resolve()).
+  department       String?
+  status           UserStatus @default(ACTIVE)
+  lastLoginAt      DateTime?  @map("last_login_at")
+  createdAt        DateTime   @default(now()) @map("created_at")
+  updatedAt        DateTime   @updatedAt @map("updated_at")
+  deletedAt        DateTime?  @map("deleted_at")
+  // Per-user Dashboard personalisation (which widgets show/hide) - see
+  // dashboard.service.ts's getWidgetPrefs()/saveWidgetPrefs(). Deliberately
+  // just a JSON blob on User rather than a new table: it's small,
+  // single-owner, single-row-per-user data with no need to be queried any
+  // way other than "this user's own preferences".
+  dashboardWidgets Json?      @map("dashboard_widgets")
+  // TOTP MFA - both default to "off"; a user opts in from their own Account
+  // settings (see auth.routes.ts's /auth/mfa/* endpoints). Secret is
+  // AES-256-GCM encrypted at rest (common/mfa-crypto.ts), never stored or
+  // returned in plaintext once setup is confirmed.
+  totpSecret       String?    @map("totp_secret")
+  totpEnabled      Boolean    @default(false) @map("totp_enabled")
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id])
+  roles              UserRole[]
+  paymentsRequested  Payment[]          @relation("PaymentRequestedBy")
+  transfersRequested Transfer[]         @relation("TransferRequestedBy")
+  approvalActions    ApprovalAction[]
+  comments           Comment[]
+  commentMentions    CommentMention[]
+  reportDefinitions  ReportDefinition[]
+  notifications      Notification[]
+  auditLogs          AuditLog[]
+  balanceUpdates     AccountBalance[]   @relation("BalanceUpdatedBy")
+  paymentTemplates   PaymentTemplate[]
+  recoveryCodes      UserRecoveryCode[]
+
+  @@index([status])
+  @@index([tenantId])
+  @@map("users")
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  LOCKED
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  tenantId    String   @map("tenant_id")
+  name        String // Admin, Finance Maker, Finance Checker, Finance Manager, Viewer
+  description String?
+  isSystem    Boolean  @default(false) @map("is_system")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id])
+  users       UserRole[]
+  permissions RolePermission[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+model Permission {
+  id          String  @id @default(cuid())
+  code        String  @unique // e.g. payments.create
+  module      String // e.g. Payments
+  description String?
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model UserRole {
+  userId String @map("user_id")
+  roleId String @map("role_id")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+model RolePermission {
+  roleId       String @map("role_id")
+  permissionId String @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Reference / Master Data
+// ─────────────────────────────────────────────────────────────
+
+// Global reference data (ISO currencies) - shared across every tenant.
+model Currency {
+  code     String  @id // ISO 4217, e.g. MYR
+  name     String
+  symbol   String
+  isActive Boolean @default(true) @map("is_active")
+  isBase   Boolean @default(false) @map("is_base")
+
+  bankAccounts     BankAccount[]
+  payments         Payment[]
+  incomingTxns     IncomingTransaction[]
+  transfers        Transfer[]
+  approvalRequests ApprovalRequest[]
+  cashForecasts    CashForecast[]
+  transactions     Transaction[]
+  accountBalances  AccountBalance[]
+
+  @@map("currencies")
+}
+
+// Cached FX reference rates (Pro+ - MODULE_KEYS.ADVANCED_INSIGHTS), global
+// reference data like Currency above - not tenant-scoped, rates don't
+// differ per tenant. One row per (base, quote, date, provider); fetched
+// from the live provider (fx-provider.ts) on first request for a given
+// day and reused for the rest of that day, so normal traffic never calls
+// out to the external API. See fx.service.ts.
+model FxRate {
+  id            String   @id @default(cuid())
+  baseCurrency  String   @map("base_currency")
+  quoteCurrency String   @map("quote_currency")
+  rate          Decimal  @db.Decimal(18, 8)
+  rateDate      DateTime @map("rate_date") @db.Date
+  provider      String   @default("frankfurter")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@unique([baseCurrency, quoteCurrency, rateDate, provider])
+  @@index([baseCurrency, rateDate])
+  @@map("fx_rates")
+}
+
+model Bank {
+  id        String     @id @default(cuid())
+  tenantId  String     @map("tenant_id")
+  name      String
+  swiftCode String?    @map("swift_code")
+  country   String     @default("MY")
+  status    BankStatus @default(ACTIVE)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+  deletedAt DateTime?  @map("deleted_at")
+
+  tenant   Tenant        @relation(fields: [tenantId], references: [id])
+  accounts BankAccount[]
+
+  @@index([tenantId])
+  @@map("banks")
+}
+
+enum BankStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bank Accounts & Balances (Cash Management Service)
+// ─────────────────────────────────────────────────────────────
+
+model BankAccount {
+  id            String      @id @default(cuid())
+  tenantId      String      @map("tenant_id")
+  bankId        String      @map("bank_id")
+  accountName   String      @map("account_name")
+  accountNumber String      @map("account_number")
+  currencyCode  String      @map("currency_code")
+  accountType   AccountType @default(OPERATING) @map("account_type")
+
+  currentBalance Decimal @default(0) @map("current_balance") @db.Decimal(18, 2)
+  reservedAmount Decimal @default(0) @map("reserved_amount") @db.Decimal(18, 2)
+  minimumBalance Decimal @default(0) @map("minimum_balance") @db.Decimal(18, 2)
+  targetBalance  Decimal @default(0) @map("target_balance") @db.Decimal(18, 2)
+
+  status        AccountStatus @default(ACTIVE)
+  lastBalanceAt DateTime?     @map("last_balance_at")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id])
+  bank     Bank     @relation(fields: [bankId], references: [id])
+  currency Currency @relation(fields: [currencyCode], references: [code])
+
+  balances          AccountBalance[]
+  transactions      Transaction[]
+  incomingTxns      IncomingTransaction[] @relation("DestinationAccount")
+  paymentsAsSource  Payment[]             @relation("PaymentSourceAccount")
+  transfersAsSource Transfer[]            @relation("TransferSourceAccount")
+  transfersAsDest   Transfer[]            @relation("TransferDestAccount")
+  cashForecasts     CashForecast[]
+  paymentTemplates  PaymentTemplate[]
+
+  @@index([tenantId])
+  @@index([bankId])
+  @@index([currencyCode])
+  @@index([status])
+  @@map("bank_accounts")
+}
+
+enum AccountType {
+  OPERATING
+  COLLECTION
+  DISBURSEMENT
+  RESERVE
+}
+
+enum AccountStatus {
+  ACTIVE
+  DORMANT
+  CLOSED
+}
+
+// Historical daily balance snapshots - powers Cash Position history & forecasting baseline
+model AccountBalance {
+  id               String        @id @default(cuid())
+  tenantId         String        @map("tenant_id")
+  accountId        String        @map("account_id")
+  currencyCode     String        @map("currency_code")
+  balanceDate      DateTime      @map("balance_date") @db.Date
+  openingBalance   Decimal       @map("opening_balance") @db.Decimal(18, 2)
+  closingBalance   Decimal       @map("closing_balance") @db.Decimal(18, 2)
+  availableBalance Decimal       @map("available_balance") @db.Decimal(18, 2)
+  source           BalanceSource @default(MANUAL)
+  updatedById      String?       @map("updated_by_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant    Tenant      @relation(fields: [tenantId], references: [id])
+  account   BankAccount @relation(fields: [accountId], references: [id])
+  currency  Currency    @relation(fields: [currencyCode], references: [code])
+  updatedBy User?       @relation("BalanceUpdatedBy", fields: [updatedById], references: [id])
+
+  @@unique([accountId, balanceDate])
+  @@index([tenantId])
+  @@index([balanceDate])
+  @@map("account_balances")
+}
+
+enum BalanceSource {
+  MANUAL
+  IMPORT
+  SYSTEM
+}
+
+// ─────────────────────────────────────────────────────────────
+// Ledger (immutable record of every cash movement)
+// ─────────────────────────────────────────────────────────────
+
+model Transaction {
+  id              String          @id @default(cuid())
+  tenantId        String          @map("tenant_id")
+  accountId       String          @map("account_id")
+  currencyCode    String          @map("currency_code")
+  type            TransactionType
+  amount          Decimal         @db.Decimal(18, 2) // always positive; direction implied by `type`
+  reference       String
+  description     String?
+  transactionDate DateTime        @map("transaction_date")
+
+  relatedPaymentId  String? @map("related_payment_id")
+  relatedTransferId String? @map("related_transfer_id")
+  relatedIncomingId String? @map("related_incoming_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant   Tenant      @relation(fields: [tenantId], references: [id])
+  account  BankAccount @relation(fields: [accountId], references: [id])
+  currency Currency    @relation(fields: [currencyCode], references: [code])
+
+  @@index([tenantId])
+  @@index([accountId])
+  @@index([transactionDate])
+  @@index([type])
+  @@map("transactions")
+}
+
+enum TransactionType {
+  PAYMENT_OUT
+  INCOMING_IN
+  TRANSFER_OUT
+  TRANSFER_IN
+  ADJUSTMENT
+}
+
+// ─────────────────────────────────────────────────────────────
+// Payments
+// ─────────────────────────────────────────────────────────────
+
+model Payment {
+  id            String @id @default(cuid())
+  tenantId      String @map("tenant_id")
+  paymentNumber String @map("payment_number")
+
+  beneficiaryName    String @map("beneficiary_name")
+  beneficiaryAccount String @map("beneficiary_account")
+  beneficiaryBank    String @map("beneficiary_bank")
+
+  amount          Decimal @db.Decimal(18, 2)
+  currencyCode    String  @map("currency_code")
+  sourceAccountId String  @map("source_account_id")
+
+  paymentDate   DateTime @map("payment_date") @db.Date
+  description   String?
+  reference     String?
+  attachmentUrl String?  @map("attachment_url")
+
+  status PaymentStatus @default(DRAFT)
+
+  requestedById String    @map("requested_by_id")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  tenant        Tenant      @relation(fields: [tenantId], references: [id])
+  sourceAccount BankAccount @relation("PaymentSourceAccount", fields: [sourceAccountId], references: [id])
+  currency      Currency    @relation(fields: [currencyCode], references: [code])
+  requestedBy   User        @relation("PaymentRequestedBy", fields: [requestedById], references: [id])
+
+  approvalRequests ApprovalRequest[]
+
+  @@unique([tenantId, paymentNumber])
+  @@index([tenantId])
+  @@index([status])
+  @@index([sourceAccountId])
+  @@index([paymentDate])
+  @@map("payments")
+}
+
+enum PaymentStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  PROCESSED
+  CANCELLED
+}
+
+// ─────────────────────────────────────────────────────────────
+// Beneficiaries (saved payee book) & Payment Templates
+// Pro/Pro+ module - see common/plans.ts MODULE_KEYS.BENEFICIARIES.
+// ─────────────────────────────────────────────────────────────
+
+// A saved payee. Payments still snapshot beneficiary name/account/bank as
+// free text (so editing/deleting a beneficiary never rewrites payment
+// history) - this is a reusable lookup that prefills those fields and
+// catches duplicate/fat-finger entry, not a foreign key on Payment.
+model Beneficiary {
+  id            String   @id @default(cuid())
+  tenantId      String   @map("tenant_id")
+  nickname      String
+  accountName   String   @map("account_name")
+  accountNumber String   @map("account_number")
+  bankName      String   @map("bank_name")
+  currencyCode  String?  @map("currency_code")
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, accountNumber, bankName])
+  @@index([tenantId])
+  @@map("beneficiaries")
+}
+
+// A saved payment shape (recurring rent, retainers, etc.) a Maker can
+// one-click into a new DRAFT payment instead of re-typing every field.
+// Deliberately no auto-scheduling/cron in this phase - see plans.ts.
+model PaymentTemplate {
+  id                 String                   @id @default(cuid())
+  tenantId           String                   @map("tenant_id")
+  name               String
+  beneficiaryName    String                   @map("beneficiary_name")
+  beneficiaryAccount String                   @map("beneficiary_account")
+  beneficiaryBank    String                   @map("beneficiary_bank")
+  amount             Decimal                  @db.Decimal(18, 2)
+  currencyCode       String                   @map("currency_code")
+  sourceAccountId    String                   @map("source_account_id")
+  description        String?
+  reference          String?
+  // Recurring auto-generation - optional, on top of the manual "Use"
+  // one-click reuse that already existed. NONE means "reuse only, never
+  // auto-created" (the original behaviour, still the default).
+  frequency          PaymentTemplateFrequency @default(NONE) @map("frequency")
+  nextRunDate        DateTime?                @map("next_run_date") @db.Date
+  isActive           Boolean                  @default(true) @map("is_active")
+  lastRunAt          DateTime?                @map("last_run_at")
+  createdById        String                   @map("created_by_id")
+  createdAt          DateTime                 @default(now()) @map("created_at")
+  updatedAt          DateTime                 @updatedAt @map("updated_at")
+
+  tenant        Tenant      @relation(fields: [tenantId], references: [id])
+  sourceAccount BankAccount @relation(fields: [sourceAccountId], references: [id])
+  createdBy     User        @relation(fields: [createdById], references: [id])
+
+  @@index([tenantId])
+  @@index([frequency, nextRunDate])
+  @@map("payment_templates")
+}
+
+enum PaymentTemplateFrequency {
+  NONE
+  WEEKLY
+  MONTHLY
+}
+
+// ─────────────────────────────────────────────────────────────
+// Incoming Transactions
+// ─────────────────────────────────────────────────────────────
+
+model IncomingTransaction {
+  id                   String         @id @default(cuid())
+  tenantId             String         @map("tenant_id")
+  reference            String
+  sourceName           String         @map("source_name")
+  amount               Decimal        @db.Decimal(18, 2)
+  currencyCode         String         @map("currency_code")
+  destinationAccountId String         @map("destination_account_id")
+  valueDate            DateTime       @map("value_date") @db.Date
+  description          String?
+  status               IncomingStatus @default(EXPECTED)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant             Tenant      @relation(fields: [tenantId], references: [id])
+  destinationAccount BankAccount @relation("DestinationAccount", fields: [destinationAccountId], references: [id])
+  currency           Currency    @relation(fields: [currencyCode], references: [code])
+
+  @@unique([tenantId, reference])
+  @@index([tenantId])
+  @@index([status])
+  @@index([destinationAccountId])
+  @@index([valueDate])
+  @@map("incoming_transactions")
+}
+
+enum IncomingStatus {
+  EXPECTED
+  RECEIVED
+  RECONCILED
+  CANCELLED
+}
+
+// ─────────────────────────────────────────────────────────────
+// Inter-bank Transfers
+// ─────────────────────────────────────────────────────────────
+
+model Transfer {
+  id             String @id @default(cuid())
+  tenantId       String @map("tenant_id")
+  transferNumber String @map("transfer_number")
+
+  sourceAccountId      String @map("source_account_id")
+  destinationAccountId String @map("destination_account_id")
+
+  amount          Decimal  @db.Decimal(18, 2)
+  suggestedAmount Decimal? @map("suggested_amount") @db.Decimal(18, 2)
+  currencyCode    String   @map("currency_code")
+
+  reason       String?
+  transferDate DateTime @map("transfer_date") @db.Date
+
+  status              TransferStatus @default(DRAFT)
+  isSystemRecommended Boolean        @default(false) @map("is_system_recommended")
+
+  requestedById String   @map("requested_by_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant             Tenant      @relation(fields: [tenantId], references: [id])
+  sourceAccount      BankAccount @relation("TransferSourceAccount", fields: [sourceAccountId], references: [id])
+  destinationAccount BankAccount @relation("TransferDestAccount", fields: [destinationAccountId], references: [id])
+  currency           Currency    @relation(fields: [currencyCode], references: [code])
+  requestedBy        User        @relation("TransferRequestedBy", fields: [requestedById], references: [id])
+
+  approvalRequests ApprovalRequest[]
+
+  @@unique([tenantId, transferNumber])
+  @@index([tenantId])
+  @@index([status])
+  @@index([sourceAccountId])
+  @@index([destinationAccountId])
+  @@map("transfers")
+}
+
+enum TransferStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  COMPLETED
+  CANCELLED
+}
+
+// ─────────────────────────────────────────────────────────────
+// Approvals (configurable multi-level workflow)
+// ─────────────────────────────────────────────────────────────
+
+model ApprovalRule {
+  id                 String             @id @default(cuid())
+  tenantId           String             @map("tenant_id")
+  entityType         ApprovalEntityType @map("entity_type")
+  currencyCode       String?            @map("currency_code")
+  // Optional cost center/department match, free-text against User.department
+  // - null matches any department, same "unset = wildcard" semantics as
+  // currencyCode above. Lets a tenant route e.g. "Ops" payments through a
+  // different approver than everyone else's, on top of the amount band.
+  department         String?
+  minAmount          Decimal            @default(0) @map("min_amount") @db.Decimal(18, 2)
+  maxAmount          Decimal?           @map("max_amount") @db.Decimal(18, 2)
+  requiredLevels     Int                @default(1) @map("required_levels")
+  requiredRoleLevel1 String             @map("required_role_level_1")
+  requiredRoleLevel2 String?            @map("required_role_level_2")
+  isActive           Boolean            @default(true) @map("is_active")
+  priority           Int                @default(0)
+  // Hours after submission before a still-PENDING request at this rule is
+  // flagged overdue and its current-level approvers re-notified. Null falls
+  // back to the tenant's approvals.default_sla_hours system setting.
+  slaHours           Int?               @map("sla_hours")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([entityType, isActive])
+  @@map("approval_rules")
+}
+
+enum ApprovalEntityType {
+  PAYMENT
+  TRANSFER
+}
+
+model ApprovalRequest {
+  id         String             @id @default(cuid())
+  tenantId   String             @map("tenant_id")
+  entityType ApprovalEntityType @map("entity_type")
+  paymentId  String?            @map("payment_id")
+  transferId String?            @map("transfer_id")
+
+  requestedById String  @map("requested_by_id")
+  amount        Decimal @db.Decimal(18, 2)
+  currencyCode  String  @map("currency_code")
+
+  status         ApprovalStatus @default(PENDING)
+  currentLevel   Int            @default(1) @map("current_level")
+  requiredLevels Int            @default(1) @map("required_levels")
+  ruleId         String?        @map("rule_id")
+
+  // SLA tracking - dueAt is (re)computed each time the request enters a
+  // level (creation, or advancing to level 2); escalatedAt is set once the
+  // overdue notification fires so the periodic check never re-notifies for
+  // the same level. Both reset to null on level advance.
+  dueAt       DateTime? @map("due_at")
+  escalatedAt DateTime? @map("escalated_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id])
+  payment  Payment?  @relation(fields: [paymentId], references: [id])
+  transfer Transfer? @relation(fields: [transferId], references: [id])
+  currency Currency  @relation(fields: [currencyCode], references: [code])
+
+  actions ApprovalAction[]
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([entityType])
+  @@index([status, dueAt])
+  @@map("approval_requests")
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model ApprovalAction {
+  id                String             @id @default(cuid())
+  tenantId          String             @map("tenant_id")
+  approvalRequestId String             @map("approval_request_id")
+  level             Int
+  actorId           String             @map("actor_id")
+  action            ApprovalActionType
+  comment           String?
+  actedAt           DateTime           @default(now()) @map("acted_at")
+
+  tenant          Tenant          @relation(fields: [tenantId], references: [id])
+  approvalRequest ApprovalRequest @relation(fields: [approvalRequestId], references: [id], onDelete: Cascade)
+  actor           User            @relation(fields: [actorId], references: [id])
+
+  @@index([tenantId])
+  @@index([approvalRequestId])
+  @@map("approval_actions")
+}
+
+enum ApprovalActionType {
+  APPROVE
+  REJECT
+  COMMENT
+}
+
+// ─────────────────────────────────────────────────────────────
+// Comments (discussion thread on a payment/transfer, with @mentions)
+// ─────────────────────────────────────────────────────────────
+
+model Comment {
+  id         String            @id @default(cuid())
+  tenantId   String            @map("tenant_id")
+  entityType CommentEntityType @map("entity_type")
+  entityId   String            @map("entity_id")
+  authorId   String            @map("author_id")
+  body       String            @db.Text
+  createdAt  DateTime          @default(now()) @map("created_at")
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id])
+  author   User             @relation(fields: [authorId], references: [id])
+  mentions CommentMention[]
+
+  @@index([tenantId])
+  @@index([entityType, entityId])
+  @@map("comments")
+}
+
+// One row per user @mentioned in a comment - a real join table, not the
+// JSON array this used to be, specifically so "every comment I've been
+// mentioned in" (across a whole tenant) is an indexed query instead of a
+// full Comment table scan with an in-app JSON filter. Cascade-deletes with
+// its Comment; a user being deleted is handled at the User-soft-delete
+// level (mentions of a deactivated user just stop resolving to anyone
+// new, same as any other reference to them elsewhere).
+model CommentMention {
+  commentId String @map("comment_id")
+  userId    String @map("user_id")
+
+  comment Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@id([commentId, userId])
+  @@index([userId])
+  @@map("comment_mentions")
+}
+
+enum CommentEntityType {
+  PAYMENT
+  TRANSFER
+}
+
+// One-time TOTP MFA backup codes - issued 8-at-a-time when MFA is first
+// enabled (see auth-mfa.service.ts). Hashed with bcrypt like passwordHash,
+// not encrypted like totpSecret, since these are single-use and meant to
+// be invalidated (usedAt set) rather than ever read back.
+model UserRecoveryCode {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  codeHash  String    @map("code_hash")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("user_recovery_codes")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Custom Report Builder (Pro+ - see common/plans.ts MODULE_KEYS.ADVANCED_REPORTING)
+// ─────────────────────────────────────────────────────────────
+
+// A saved "pick your columns" report: baseReport identifies which of
+// reports.service.ts's existing datasets to run (same data every built-in
+// report already uses - this never bypasses tenant scoping or adds new
+// data access), columns is the chosen subset/order of that dataset's
+// available columns. Running it (GET /reports/custom/:id) reuses the exact
+// same fetch + column-projection logic, just with a caller-chosen column
+// set instead of the fixed one each built-in report ships with.
+model ReportDefinition {
+  id          String   @id @default(cuid())
+  tenantId    String   @map("tenant_id")
+  name        String
+  baseReport  String   @map("base_report")
+  columns     Json
+  createdById String   @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id])
+  createdBy User   @relation(fields: [createdById], references: [id])
+
+  @@index([tenantId])
+  @@map("report_definitions")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Cash Forecasting
+// ─────────────────────────────────────────────────────────────
+
+model CashForecast {
+  id              String             @id @default(cuid())
+  tenantId        String             @map("tenant_id")
+  accountId       String?            @map("account_id")
+  currencyCode    String             @map("currency_code")
+  forecastDate    DateTime           @map("forecast_date") @db.Date
+  category        ForecastCategory
+  sourceType      ForecastSourceType @map("source_type")
+  sourceReference String?            @map("source_reference")
+  amount          Decimal            @db.Decimal(18, 2)
+  confidence      ForecastConfidence @default(MEDIUM)
+  description     String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant       @relation(fields: [tenantId], references: [id])
+  account  BankAccount? @relation(fields: [accountId], references: [id])
+  currency Currency     @relation(fields: [currencyCode], references: [code])
+
+  @@index([tenantId])
+  @@index([forecastDate])
+  @@index([accountId])
+  @@index([category])
+  @@map("cash_forecasts")
+}
+
+enum ForecastCategory {
+  INFLOW
+  OUTFLOW
+}
+
+enum ForecastSourceType {
+  PAYMENT
+  INCOMING
+  TRANSFER
+  MANUAL
+}
+
+enum ForecastConfidence {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+// ─────────────────────────────────────────────────────────────
+// Notifications
+// ─────────────────────────────────────────────────────────────
+
+model Notification {
+  id                String           @id @default(cuid())
+  tenantId          String           @map("tenant_id")
+  userId            String           @map("user_id")
+  title             String
+  message           String
+  type              NotificationType @default(INFO)
+  isRead            Boolean          @default(false) @map("is_read")
+  relatedEntityType String?          @map("related_entity_type")
+  relatedEntityId   String?          @map("related_entity_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User   @relation(fields: [userId], references: [id])
+
+  @@index([tenantId])
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+enum NotificationType {
+  INFO
+  WARNING
+  ALERT
+  APPROVAL
+}
+
+// ─────────────────────────────────────────────────────────────
+// Audit Trail
+// ─────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  tenantId    String   @map("tenant_id")
+  actorId     String?  @map("actor_id")
+  action      String // e.g. "payment.create", "transfer.approve"
+  entityType  String   @map("entity_type")
+  entityId    String?  @map("entity_id")
+  beforeState Json?    @map("before_state")
+  afterState  Json?    @map("after_state")
+  ipAddress   String?  @map("ip_address")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  actor  User?  @relation(fields: [actorId], references: [id])
+
+  @@index([tenantId])
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────
+// System Settings
+// ─────────────────────────────────────────────────────────────
+
+// Tenant-scoped key/value config (base currency, company name, cash-engine
+// tunables, and per-tenant document-number counters).
+model SystemSetting {
+  tenantId    String   @map("tenant_id")
+  key         String
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  updatedById String?  @map("updated_by_id")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@id([tenantId, key])
+  @@map("system_settings")
+}
