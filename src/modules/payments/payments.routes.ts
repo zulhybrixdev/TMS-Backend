@@ -8,7 +8,7 @@ import { parseListQuery } from "../../common/pagination";
 import { PERMISSIONS } from "../../common/permissions";
 import { MODULE_KEYS } from "../../common/plans";
 import { paymentsService } from "./payments.service";
-import { createPaymentSchema, updatePaymentSchema, bulkCreatePaymentsSchema } from "./payments.schemas";
+import { createPaymentSchema, updatePaymentSchema, bulkCreatePaymentsSchema, reschedulePaymentSchema } from "./payments.schemas";
 
 export const paymentsRouter = Router();
 paymentsRouter.use(requirePermission(PERMISSIONS.PAYMENTS_VIEW, PERMISSIONS.PAYMENTS_CREATE));
@@ -20,6 +20,7 @@ paymentsRouter.get(
     const { items, meta } = await paymentsService.list(req.user!.tenantId, query, {
       status: req.query.status as string | undefined,
       sourceAccountId: req.query.sourceAccountId as string | undefined,
+      paymentMethod: req.query.paymentMethod as string | undefined,
       from: req.query.from as string | undefined,
       to: req.query.to as string | undefined,
     });
@@ -56,6 +57,13 @@ paymentsRouter.post(
   "/:id/submit",
   requirePermission(PERMISSIONS.PAYMENTS_CREATE),
   asyncHandler(async (req, res) => ok(res, await paymentsService.submit(req.user!.tenantId, req.params.id, req.user!.id)))
+);
+
+paymentsRouter.post(
+  "/:id/reschedule",
+  requirePermission(PERMISSIONS.PAYMENTS_CREATE),
+  validate(reschedulePaymentSchema),
+  asyncHandler(async (req, res) => ok(res, await paymentsService.reschedule(req.user!.tenantId, req.params.id, req.body, req.user!.id)))
 );
 
 paymentsRouter.post(

@@ -44,6 +44,11 @@ import { notificationsRouter } from "./modules/notifications/notifications.route
 import { currenciesRouter } from "./modules/currencies/currencies.routes";
 import { fxRouter } from "./modules/fx/fx.routes";
 import { auditLogsRouter } from "./modules/audit-logs/audit-logs.routes";
+import { treasuryDeskRouter } from "./modules/treasury-desk/treasury-desk.routes";
+import { bankerAcceptancesRouter } from "./modules/banker-acceptances/banker-acceptances.routes";
+import { instrumentQuotasRouter } from "./modules/instrument-quotas/instrument-quotas.routes";
+import { releaseDueApprovedPayments } from "./modules/payments/payment-release";
+import { releaseDueApprovedTransfers } from "./modules/transfers/transfer-release";
 
 const app = express();
 
@@ -55,7 +60,7 @@ const app = express();
 // whole app, not a path-scoped second one: the `cors` package answers an
 // OPTIONS preflight itself and ends the request, so a later path-scoped
 // cors() middleware would never even run for those requests.
-const PLATFORM_CONSOLE_ORIGIN = "http://localhost:3417";
+const PLATFORM_CONSOLE_ORIGIN = env.platformConsoleOrigin;
 app.use(helmet());
 app.use(cors({ origin: [env.corsOrigin, PLATFORM_CONSOLE_ORIGIN], credentials: true }));
 app.use(express.json({ limit: "2mb" }));
@@ -119,6 +124,9 @@ app.use("/api/dashboard", dashboardRouter);
 app.use("/api/notifications", notificationsRouter);
 app.use("/api/currencies", currenciesRouter);
 app.use("/api/fx", fxRouter);
+app.use("/api/treasury-desk", treasuryDeskRouter);
+app.use("/api/banker-acceptances", bankerAcceptancesRouter);
+app.use("/api/instrument-quotas", instrumentQuotasRouter);
 
 // Serves the frontend build(s) from this one port. /platform is always
 // reachable, on every tier (uat and production alike) - see index route
@@ -195,5 +203,23 @@ setInterval(() => {
     console.error("[tms-backend] payment template sweep failed:", err);
   });
 }, 60 * 60 * 1000);
+
+// Scheduled release: an approved payment/transfer dated in the future is only
+// posted to the ledger on its due date, so the cash leaves the account on the
+// day the forecast said it would. Runs once at boot (catches anything that
+// fell due while the process was down) and then every 15 minutes - a
+// payment is never more than one interval late. Same single-instance
+// caveat as the sweeps above.
+const runScheduledRelease = async () => {
+  try {
+    await releaseDueApprovedPayments();
+    await releaseDueApprovedTransfers();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[tms-backend] scheduled release failed:", err);
+  }
+};
+runScheduledRelease();
+setInterval(runScheduledRelease, 15 * 60 * 1000);
 
 export default app;

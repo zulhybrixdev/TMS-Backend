@@ -5,6 +5,7 @@ export interface AnomalyResult {
   reason?: string;
 }
 
+export const NO_ACCOUNT = "-";
 const ESTABLISHED_MULTIPLIER = 3; // 3x this beneficiary's own average, once we have a track record for them
 const FIRST_TIME_MULTIPLIER = 5; // 5x the tenant's typical payment size, for a beneficiary we've never paid before
 const MIN_HISTORY_FOR_TENANT_BASELINE = 3;
@@ -18,11 +19,15 @@ const MIN_HISTORY_FOR_TENANT_BASELINE = 3;
 //   2. Never-paid-before beneficiary: amount is a large multiple of what
 //      this tenant typically pays *anyone*, since there's no per-beneficiary
 //      baseline yet to compare against.
-export async function detectPaymentAnomaly(tenantId: string, beneficiaryAccount: string, amount: number, excludePaymentId?: string): Promise<AnomalyResult> {
+// beneficiaryAccount "-" means a cheque / bank draft payee with no account,
+// so those are grouped by payee name instead of all collapsing into one
+// "beneficiary".
+export async function detectPaymentAnomaly(tenantId: string, beneficiaryAccount: string, amount: number, excludePaymentId?: string, beneficiaryName?: string): Promise<AnomalyResult> {
   const priorToThisBeneficiary = await prisma.payment.findMany({
     where: {
       tenantId,
       beneficiaryAccount,
+      ...(beneficiaryAccount === NO_ACCOUNT && beneficiaryName ? { beneficiaryName } : {}),
       deletedAt: null,
       status: { notIn: ["DRAFT", "REJECTED", "CANCELLED"] },
       ...(excludePaymentId ? { id: { not: excludePaymentId } } : {}),

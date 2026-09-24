@@ -81,6 +81,8 @@ model Tenant {
   comments             Comment[]
   reportDefinitions    ReportDefinition[]
   cashForecasts        CashForecast[]
+  bankerAcceptances    BankerAcceptance[]
+  instrumentQuotas     InstrumentQuota[]
   notifications        Notification[]
   auditLogs            AuditLog[]
   systemSettings       SystemSetting[]
@@ -234,6 +236,7 @@ model User {
   auditLogs          AuditLog[]
   balanceUpdates     AccountBalance[]   @relation("BalanceUpdatedBy")
   paymentTemplates   PaymentTemplate[]
+  bankerAcceptances  BankerAcceptance[] @relation("BaCreatedBy")
   recoveryCodes      UserRecoveryCode[]
 
   @@index([status])
@@ -355,8 +358,9 @@ model Bank {
   updatedAt DateTime   @updatedAt @map("updated_at")
   deletedAt DateTime?  @map("deleted_at")
 
-  tenant   Tenant        @relation(fields: [tenantId], references: [id])
+  tenant   Tenant            @relation(fields: [tenantId], references: [id])
   accounts BankAccount[]
+  quotas   InstrumentQuota[]
 
   @@index([tenantId])
   @@map("banks")
@@ -385,6 +389,16 @@ model BankAccount {
   minimumBalance Decimal @default(0) @map("minimum_balance") @db.Decimal(18, 2)
   targetBalance  Decimal @default(0) @map("target_balance") @db.Decimal(18, 2)
 
+  // Approved overdraft facility on this account (0 = none). currentBalance
+  // may go negative down to -overdraftLimit; the negative part is the
+  // overdraft utilised. See treasury-engine/cash-engine.service.ts.
+  overdraftLimit Decimal @default(0) @map("overdraft_limit") @db.Decimal(18, 2)
+
+  // Free-text site/entity this account's cash belongs to (e.g. "PJRM",
+  // "Bukit Raja") - groups the cash-reserve view. Picklist of existing
+  // values, same convention as User.department.
+  siteName String? @map("site_name") @db.VarChar(100)
+
   status        AccountStatus @default(ACTIVE)
   lastBalanceAt DateTime?     @map("last_balance_at")
 
@@ -396,14 +410,16 @@ model BankAccount {
   bank     Bank     @relation(fields: [bankId], references: [id])
   currency Currency @relation(fields: [currencyCode], references: [code])
 
-  balances          AccountBalance[]
-  transactions      Transaction[]
-  incomingTxns      IncomingTransaction[] @relation("DestinationAccount")
-  paymentsAsSource  Payment[]             @relation("PaymentSourceAccount")
-  transfersAsSource Transfer[]            @relation("TransferSourceAccount")
-  transfersAsDest   Transfer[]            @relation("TransferDestAccount")
-  cashForecasts     CashForecast[]
-  paymentTemplates  PaymentTemplate[]
+  balances                  AccountBalance[]
+  transactions              Transaction[]
+  incomingTxns              IncomingTransaction[] @relation("DestinationAccount")
+  paymentsAsSource          Payment[]             @relation("PaymentSourceAccount")
+  transfersAsSource         Transfer[]            @relation("TransferSourceAccount")
+  transfersAsDest           Transfer[]            @relation("TransferDestAccount")
+  cashForecasts             CashForecast[]
+  paymentTemplates          PaymentTemplate[]
+  bankerAcceptancesCredited BankerAcceptance[]    @relation("BaCreditAccount")
+  bankerAcceptancesSettled  BankerAcceptance[]    @relation("BaSettlementAccount")
 
   @@index([tenantId])
   @@index([bankId])
@@ -475,6 +491,7 @@ model Transaction {
   relatedPaymentId  String? @map("related_payment_id")
   relatedTransferId String? @map("related_transfer_id")
   relatedIncomingId String? @map("related_incoming_id")
+  relatedBaId       String? @map("related_ba_id")
 
   createdAt DateTime @default(now()) @map("created_at")
 
@@ -495,6 +512,8 @@ enum TransactionType {
   TRANSFER_OUT
   TRANSFER_IN
   ADJUSTMENT
+  BA_DRAWDOWN // banker acceptance proceeds credited (inflow)
+  BA_SETTLEMENT // banker acceptance settled at maturity (outflow)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -514,10 +533,18 @@ model Payment {
   currencyCode    String  @map("currency_code")
   sourceAccountId String  @map("source_account_id")
 
+  // paymentDate doubles as the AP due date - the day the cash is expected
+  // to leave the account (the forecast debits it on this day, and an
+  // approved future-dated payment is only posted to the ledger on it).
   paymentDate   DateTime @map("payment_date") @db.Date
   description   String?
   reference     String?
+  invoiceNumber String?  @map("invoice_number") @db.VarChar(100)
   attachmentUrl String?  @map("attachment_url")
+
+  // How the payment is released - drives the cheque / bank draft
+  // released-quota display (InstrumentQuota).
+  paymentMethod PaymentMethod @default(TRANSFER) @map("payment_method")
 
   status PaymentStatus @default(DRAFT)
 
@@ -538,7 +565,14 @@ model Payment {
   @@index([status])
   @@index([sourceAccountId])
   @@index([paymentDate])
+  @@index([paymentMethod, paymentDate])
   @@map("payments")
+}
+
+enum PaymentMethod {
+  TRANSFER
+  CHEQUE
+  BANK_DRAFT
 }
 
 enum PaymentStatus {
@@ -633,7 +667,15 @@ model IncomingTransaction {
   destinationAccountId String         @map("destination_account_id")
   valueDate            DateTime       @map("value_date") @db.Date
   description          String?
+  invoiceNumber        String?        @map("invoice_number") @db.VarChar(100)
   status               IncomingStatus @default(EXPECTED)
+
+  // Cheque float: business days between the funds being booked and them
+  // being usable (0 = cleared immediately, 1 = "day 1 float", 2 = "day 2
+  // float"). clearingDate is set when the transaction is marked received;
+  // until then the amount counts as float, not available balance.
+  floatDays    Int       @default(0) @map("float_days")
+  clearingDate DateTime? @map("clearing_date") @db.Date
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -647,6 +689,7 @@ model IncomingTransaction {
   @@index([status])
   @@index([destinationAccountId])
   @@index([valueDate])
+  @@index([clearingDate])
   @@map("incoming_transactions")
 }
 
@@ -959,6 +1002,83 @@ enum ForecastConfidence {
   HIGH
   MEDIUM
   LOW
+}
+
+// ─────────────────────────────────────────────────────────────
+// Banker Acceptance (BA) facility usage
+// ─────────────────────────────────────────────────────────────
+
+// One row per BA drawdown. Drawdown credits `proceedsAmount` to
+// creditAccount (ledger type BA_DRAWDOWN); settlement at/after maturity
+// debits the amount actually paid (ledger type BA_SETTLEMENT) from
+// settlementAccount. Face less proceeds is the discount/interest cost.
+model BankerAcceptance {
+  id          String @id @default(cuid())
+  tenantId    String @map("tenant_id")
+  referenceNo String @map("reference_no")
+
+  creditAccountId     String @map("credit_account_id")
+  settlementAccountId String @map("settlement_account_id")
+  currencyCode        String @map("currency_code")
+
+  faceAmount     Decimal  @map("face_amount") @db.Decimal(18, 2) // payable at maturity
+  proceedsAmount Decimal  @map("proceeds_amount") @db.Decimal(18, 2) // credited on drawdown
+  drawdownDate   DateTime @map("drawdown_date") @db.Date
+  maturityDate   DateTime @map("maturity_date") @db.Date
+
+  status        BankerAcceptanceStatus @default(OUTSTANDING)
+  settledDate   DateTime?              @map("settled_date") @db.Date
+  settledAmount Decimal?               @map("settled_amount") @db.Decimal(18, 2)
+  description   String?
+
+  createdById String   @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant            Tenant      @relation(fields: [tenantId], references: [id])
+  creditAccount     BankAccount @relation("BaCreditAccount", fields: [creditAccountId], references: [id])
+  settlementAccount BankAccount @relation("BaSettlementAccount", fields: [settlementAccountId], references: [id])
+  createdBy         User        @relation("BaCreatedBy", fields: [createdById], references: [id])
+
+  @@unique([tenantId, referenceNo])
+  @@index([tenantId])
+  @@index([status, maturityDate])
+  @@index([drawdownDate])
+  @@map("banker_acceptances")
+}
+
+enum BankerAcceptanceStatus {
+  OUTSTANDING
+  SETTLED
+}
+
+// ─────────────────────────────────────────────────────────────
+// Released quotas (cheque / bank draft)
+// ─────────────────────────────────────────────────────────────
+
+// A per-day ceiling on how much (amount and/or count) can be released by
+// cheque or bank draft, optionally for one bank only (e.g. the MBSB bank
+// draft quota). bankId NULL = all banks combined. Usage is derived from
+// payments (Payment.paymentMethod, paymentDate, status) - see
+// modules/instrument-quotas.
+model InstrumentQuota {
+  id               String        @id @default(cuid())
+  tenantId         String        @map("tenant_id")
+  paymentMethod    PaymentMethod @map("payment_method")
+  bankId           String?       @map("bank_id")
+  dailyAmountLimit Decimal?      @map("daily_amount_limit") @db.Decimal(18, 2)
+  dailyCountLimit  Int?          @map("daily_count_limit")
+  currencyCode     String        @default("MYR") @map("currency_code")
+  isActive         Boolean       @default(true) @map("is_active")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  bank   Bank?  @relation(fields: [bankId], references: [id])
+
+  @@index([tenantId])
+  @@index([bankId])
+  @@map("instrument_quotas")
 }
 
 // ─────────────────────────────────────────────────────────────

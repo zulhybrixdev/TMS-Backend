@@ -4,6 +4,7 @@ import { NotFoundError } from "../../common/errors";
 import { auditService } from "../../common/audit.service";
 import { notificationsService } from "../notifications/notifications.service";
 import { paymentsService } from "../payments/payments.service";
+import { isoDate, toDateOnly, todayDateOnly } from "../../common/dates";
 
 interface TemplateInput {
   name: string;
@@ -55,7 +56,7 @@ export const paymentTemplatesService = {
     // A recurring template needs a nextRunDate to ever fire - default to
     // today (fires on the next sweep) if the caller set a frequency but no
     // explicit start date.
-    const resolvedNextRunDate = rest.frequency && rest.frequency !== "NONE" ? new Date(nextRunDate ?? new Date().toISOString().slice(0, 10)) : nextRunDate ? new Date(nextRunDate) : undefined;
+    const resolvedNextRunDate = rest.frequency && rest.frequency !== "NONE" ? toDateOnly(nextRunDate ?? isoDate(todayDateOnly())) : nextRunDate ? new Date(nextRunDate) : undefined;
     const template = await prisma.paymentTemplate.create({ data: { ...rest, nextRunDate: resolvedNextRunDate, tenantId, createdById: actorId } });
     await auditService.record({ tenantId, actorId, action: "payment_template.create", entityType: "PaymentTemplate", entityId: template.id, afterState: serialize(template) });
     return serialize(template);
@@ -96,7 +97,7 @@ export const paymentTemplatesService = {
         amount: overrides.amount ?? Number(template.amount),
         currencyCode: template.currencyCode,
         sourceAccountId: template.sourceAccountId,
-        paymentDate: overrides.paymentDate ?? new Date().toISOString().slice(0, 10),
+        paymentDate: overrides.paymentDate ?? isoDate(todayDateOnly()),
         description: template.description ?? undefined,
         reference: template.reference ?? undefined,
       },
@@ -125,7 +126,7 @@ export const paymentTemplatesService = {
   // stays the 1st) even if a run was a day late.
   async runScheduledTemplates() {
     const due = await prisma.paymentTemplate.findMany({
-      where: { isActive: true, frequency: { not: "NONE" }, nextRunDate: { lte: new Date() } },
+      where: { isActive: true, frequency: { not: "NONE" }, nextRunDate: { lte: todayDateOnly() } },
     });
 
     let created = 0;

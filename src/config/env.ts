@@ -92,4 +92,8 @@ export const env = {
   // mirrors uat's /poc-redirect behaviour). Not used for any access
   // control or environment-branching logic, only display.
   tierLabel: process.env.TIER_LABEL ?? "UAT",
+
+  // Origin the Platform Console (served only by the dev tier's Vite server)
+  // is loaded from, so this tier's CORS allows it to call /api/platform.
+  platformConsoleOrigin: process.env.PLATFORM_CONSOLE_ORIGIN ?? "http://localhost:3417",
 };

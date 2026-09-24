@@ -4,8 +4,8 @@ import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from ".
 import { auditService } from "../../common/audit.service";
 import { notificationsService } from "../notifications/notifications.service";
 import { approvalRulesService } from "./approval-rules.service";
-import { postLedgerEntry } from "../../treasury-engine/ledger.service";
-import { validateTransferAmount } from "../../treasury-engine/cash-engine.service";
+import { isDueForRelease, postPaymentToLedger } from "../payments/payment-release";
+import { isTransferDue, postTransferToLedger } from "../transfers/transfer-release";
 import { systemSettingsService, SETTING_KEYS } from "../system-settings/system-settings.service";
 import { ParsedListQuery, buildMeta } from "../../common/pagination";
 
@@ -159,12 +159,14 @@ export const approvalsService = {
           await notifyLevelApprovers(tx, tenantId, nextRole, request.entityType, Number(request.amount), request.currencyCode, request.id);
         } else {
           await tx.approvalRequest.update({ where: { id: request.id }, data: { status: "APPROVED" } });
-          await executeEntity(tx, tenantId, request, actor.id);
+          const { scheduledFor } = await executeEntity(tx, tenantId, request, actor.id);
           await notificationsService.notify({
             tenantId,
             userId: requesterId,
             title: "Request approved",
-            message: `${labelOf({ ...request, payment: request.payment, transfer: request.transfer })} has been fully approved and processed.`,
+            message: scheduledFor
+              ? `${labelOf({ ...request, payment: request.payment, transfer: request.transfer })} has been fully approved and is scheduled to post on ${scheduledFor.toISOString().slice(0, 10)}.`
+              : `${labelOf({ ...request, payment: request.payment, transfer: request.transfer })} has been fully approved and processed.`,
             type: "APPROVAL",
             relatedEntityType: request.entityType,
             relatedEntityId: request.paymentId ?? request.transferId ?? undefined,
@@ -272,55 +274,25 @@ async function rejectEntity(tx: TxClient, request: { entityType: ApprovalEntityT
   }
 }
 
-async function executeEntity(tx: TxClient, tenantId: string, request: { entityType: ApprovalEntityType; paymentId: string | null; transferId: string | null }, actorId: string) {
+async function executeEntity(tx: TxClient, tenantId: string, request: { entityType: ApprovalEntityType; paymentId: string | null; transferId: string | null }, actorId: string): Promise<{ scheduledFor?: Date }> {
   if (request.entityType === "PAYMENT" && request.paymentId) {
     const payment = await tx.payment.findUniqueOrThrow({ where: { id: request.paymentId } });
-    await postLedgerEntry(tx, {
-      tenantId,
-      accountId: payment.sourceAccountId,
-      currencyCode: payment.currencyCode,
-      type: "PAYMENT_OUT",
-      amount: Number(payment.amount),
-      reference: payment.paymentNumber,
-      description: `Payment to ${payment.beneficiaryName}: ${payment.description ?? ""}`,
-      relatedPaymentId: payment.id,
-    });
-    await tx.payment.update({ where: { id: payment.id }, data: { status: "PROCESSED" } });
+    // Cash leaves on the due date: a future-dated payment stays APPROVED and
+    // is posted by the release sweep (payment-release.ts) on its day.
+    if (!isDueForRelease(payment.paymentDate)) {
+      await tx.payment.update({ where: { id: payment.id }, data: { status: "APPROVED" } });
+      return { scheduledFor: payment.paymentDate };
+    }
+    await postPaymentToLedger(tx, tenantId, payment);
   } else if (request.entityType === "TRANSFER" && request.transferId) {
     const transfer = await tx.transfer.findUniqueOrThrow({ where: { id: request.transferId } });
-    const source = await tx.bankAccount.findUniqueOrThrow({ where: { id: transfer.sourceAccountId } });
-
-    // Re-validate at execution time in case balances moved since submission.
-    const check = validateTransferAmount(
-      { currentBalance: Number(source.currentBalance), reservedAmount: Number(source.reservedAmount), minimumBalance: Number(source.minimumBalance) },
-      Number(transfer.amount)
-    );
-    if (!check.valid) {
-      throw new BadRequestError(`Cannot execute transfer: ${check.reason}`);
+    if (!isTransferDue(transfer.transferDate)) {
+      await tx.transfer.update({ where: { id: transfer.id }, data: { status: "APPROVED" } });
+      return { scheduledFor: transfer.transferDate };
     }
-
-    await postLedgerEntry(tx, {
-      tenantId,
-      accountId: transfer.sourceAccountId,
-      currencyCode: transfer.currencyCode,
-      type: "TRANSFER_OUT",
-      amount: Number(transfer.amount),
-      reference: transfer.transferNumber,
-      description: transfer.reason ?? "Inter-bank transfer",
-      relatedTransferId: transfer.id,
-    });
-    await postLedgerEntry(tx, {
-      tenantId,
-      accountId: transfer.destinationAccountId,
-      currencyCode: transfer.currencyCode,
-      type: "TRANSFER_IN",
-      amount: Number(transfer.amount),
-      reference: transfer.transferNumber,
-      description: transfer.reason ?? "Inter-bank transfer",
-      relatedTransferId: transfer.id,
-    });
-    await tx.transfer.update({ where: { id: transfer.id }, data: { status: "COMPLETED" } });
+    await postTransferToLedger(tx, tenantId, transfer.id);
   }
+  return {};
 }
 
 function serialize(request: any) {

@@ -32,6 +32,14 @@ const liveCache = new Map<string, LiveCacheEntry>();
 // one shared promise instead of starting its own.
 const inFlight = new Map<string, Promise<LiveCacheEntry>>();
 
+// After the daily-rate provider fails, don't call it again for a while: the
+// forecast, cash position, dashboard and history all convert currencies on
+// every request, and each attempt against an unreachable provider costs its
+// full 8s timeout. Cached (even stale) rates keep serving meanwhile.
+const PROVIDER_COOLDOWN_MS = 2 * 60 * 1000;
+let providerDownUntil = 0;
+const dailyInFlight = new Map<string, Promise<Awaited<ReturnType<FxProvider["getRates"]>>>>();
+
 function todayDateOnly(): Date {
   const d = new Date();
   d.setUTCHours(0, 0, 0, 0);
@@ -62,7 +70,15 @@ export const fxService = {
     if (missing.length === 0) return result;
 
     try {
-      const fresh = await provider.getRates(base, missing);
+      if (Date.now() < providerDownUntil) throw new Error("FX provider in cool-down after a recent failure");
+      // Concurrent requests for the same pair share one call.
+      const flightKey = `${base}:${[...missing].sort().join(",")}`;
+      let flight = dailyInFlight.get(flightKey);
+      if (!flight) {
+        flight = provider.getRates(base, missing).finally(() => dailyInFlight.delete(flightKey));
+        dailyInFlight.set(flightKey, flight);
+      }
+      const fresh = await flight;
       if (fresh.length > 0) {
         await prisma.fxRate.createMany({
           data: fresh.map((f) => ({ baseCurrency: f.base, quoteCurrency: f.quote, rate: f.rate, rateDate: new Date(f.date), provider: "frankfurter" })),
@@ -71,8 +87,10 @@ export const fxService = {
         for (const f of fresh) result[f.quote] = f.rate;
       }
     } catch (err) {
+      const alreadyCoolingDown = Date.now() < providerDownUntil;
+      providerDownUntil = Date.now() + PROVIDER_COOLDOWN_MS;
       // eslint-disable-next-line no-console
-      console.error("[fx] live provider unreachable, falling back to last cached rate:", err);
+      if (!alreadyCoolingDown) console.error("[fx] live provider unreachable, falling back to last cached rate:", err);
     }
 
     const stillMissing = uniqueQuotes.filter((q) => !(q in result));

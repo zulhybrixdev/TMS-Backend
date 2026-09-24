@@ -11,7 +11,11 @@ import { incomingService } from "../src/modules/incoming/incoming.service";
 import { approvalsService } from "../src/modules/approvals/approvals.service";
 import { generateDocumentNumber } from "../src/common/id-generator";
 
-const DEMO_PASSWORD = "Password123!";
+// Local dev/uat keep the well-known demo password. For any real server set
+// SEED_DEMO_PASSWORD (deploy/setup-server.sh does), and for production
+// SEED_PLATFORM_ADMIN_ONLY=true so only the platform admin is created - no
+// demo tenant/users with a guessable login.
+const DEMO_PASSWORD = process.env.SEED_DEMO_PASSWORD ?? "Password123!";
 const DEMO_DOMAIN = "treasurysystem.com.my";
 const PLATFORM_ADMIN_EMAIL = `platform-admin@${DEMO_DOMAIN}`;
 
@@ -23,6 +27,12 @@ async function main() {
     create: { email: PLATFORM_ADMIN_EMAIL, name: "Platform Operations", passwordHash: platformAdminPasswordHash },
     update: {},
   });
+
+  if (process.env.SEED_PLATFORM_ADMIN_ONLY === "true") {
+    console.log("SEED_PLATFORM_ADMIN_ONLY=true - platform admin created, skipping the demo tenant.");
+    console.log("  %s   password: %s", PLATFORM_ADMIN_EMAIL, DEMO_PASSWORD);
+    return;
+  }
 
   const alreadySeeded = await prisma.tenant.count();
   if (alreadySeeded > 0) {

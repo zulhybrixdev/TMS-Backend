@@ -30,6 +30,7 @@ export const MODULE_KEYS = {
   BENEFICIARIES: "beneficiaries", // saved payee book, bulk payment upload, payment templates
   AUDIT: "audit", // self-serve tenant audit trail viewing (Pro+ exclusive)
   ADVANCED_INSIGHTS: "advanced_insights", // executive dashboard, custom report builder, consolidated FX cash position, saved dashboard layout (Pro+ exclusive)
+  TREASURY_DESK: "treasury_desk", // Daily Cash Desk, banker acceptances, cheque/bank-draft quotas, site cash reserve, daily-movement & BA reports (Pro+ exclusive)
   SSO: "sso", // Keycloak-brokered SSO (Pro+ exclusive) - see modules/auth/sso*.ts. Also hidden entirely for accountType=INDIVIDUAL tenants (frontend check, not plan-gated - a single-user tenant has no "company IdP" to federate)
 } as const;
 
@@ -63,7 +64,7 @@ const PRO_MODULES: ModuleKeyValue[] = [
 // exist beyond "higher user/account caps" - see common/plans.ts history:
 // Pro and Pro+ used to share PRO_MODULES verbatim, so upgrading from Pro to
 // Pro+ bought nothing but headroom.
-const PRO_PLUS_MODULES: ModuleKeyValue[] = [...PRO_MODULES, MODULE_KEYS.AUDIT, MODULE_KEYS.ADVANCED_INSIGHTS, MODULE_KEYS.SSO];
+const PRO_PLUS_MODULES: ModuleKeyValue[] = [...PRO_MODULES, MODULE_KEYS.AUDIT, MODULE_KEYS.ADVANCED_INSIGHTS, MODULE_KEYS.TREASURY_DESK, MODULE_KEYS.SSO];
 
 export const PLAN_CATALOG: Record<PlanKeyValue, PlanDefinition> = {
   [PLAN_KEYS.FREE]: {

@@ -24,6 +24,8 @@ bankAccountsRouter.get(
   })
 );
 
+bankAccountsRouter.get("/sites", asyncHandler(async (req, res) => ok(res, await bankAccountsService.listSites(req.user!.tenantId))));
+
 bankAccountsRouter.get("/:id", asyncHandler(async (req, res) => ok(res, await bankAccountsService.getById(req.user!.tenantId, req.params.id))));
 
 bankAccountsRouter.get(

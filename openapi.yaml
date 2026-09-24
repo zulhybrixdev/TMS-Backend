@@ -20,6 +20,9 @@ tags:
   - name: Transfers
   - name: Approvals
   - name: Forecast
+  - name: Treasury Desk
+  - name: Banker Acceptances
+  - name: Quotas
   - name: Reports
   - name: Administration
   - name: Audit
@@ -287,6 +290,152 @@ paths:
       responses:
         "200": { description: OK }
 
+  /payments/{id}/reschedule:
+    post:
+      tags: [Payments]
+      summary: Adjust a payment's due date (until it is posted); audit-logged
+      description: Allowed while DRAFT, PENDING_APPROVAL or APPROVED. Moving an APPROVED payment to today or earlier posts it immediately.
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentDate]
+              properties:
+                paymentDate: { type: string, format: date }
+                reason: { type: string }
+      responses:
+        "200": { description: OK }
+        "409": { description: Payment already posted, cancelled or rejected }
+
+  /incoming-transactions/{id}/reschedule:
+    post:
+      tags: [Incoming Transactions]
+      summary: Adjust an expected collection's due date; audit-logged
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [valueDate]
+              properties:
+                valueDate: { type: string, format: date }
+                reason: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /forecasts/projection/detail:
+    get:
+      tags: [Forecast]
+      summary: Day-by-day projection with per-bank/account breakdown
+      description: >
+        Simulated from today's balances. Per account per day: book, available (book - reserved - uncleared float)
+        and liquidity (available + overdraft limit). Company totals are in the base currency unless currencyCode is given;
+        currencies without an FX rate are listed in unconvertedCurrencies.
+      parameters:
+        - { in: query, name: from, schema: { type: string, format: date } }
+        - { in: query, name: to, schema: { type: string, format: date } }
+        - { in: query, name: currencyCode, schema: { type: string } }
+        - { in: query, name: accountId, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /treasury-desk/daily:
+    get:
+      tags: [Treasury Desk]
+      summary: Per-account daily position - opening, movements, closing, overdraft, float, reserve
+      parameters: [{ in: query, name: date, schema: { type: string, format: date }, description: "Defaults to today; future dates are clamped to today" }]
+      responses:
+        "200": { description: OK }
+
+  /treasury-desk/balance-grid:
+    get:
+      tags: [Treasury Desk]
+      summary: Bank x date balances - recent actuals then projected days
+      parameters:
+        - { in: query, name: past, schema: { type: integer, default: 5, maximum: 30 } }
+        - { in: query, name: ahead, schema: { type: integer, default: 10, maximum: 60 } }
+      responses:
+        "200": { description: OK }
+
+  /treasury-desk/reserves:
+    get:
+      tags: [Treasury Desk]
+      summary: Cash reserve by site/entity and currency
+      responses:
+        "200": { description: OK }
+
+  /banker-acceptances:
+    get:
+      tags: [Banker Acceptances]
+      summary: List banker acceptances (with tenor, discount and effective rate)
+      parameters:
+        - { in: query, name: status, schema: { type: string, enum: [OUTSTANDING, SETTLED] } }
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [Banker Acceptances]
+      summary: Draw down a BA - credits the proceeds to the account (requires accounts.manage)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BankerAcceptanceInput" }
+      responses:
+        "201": { description: Created }
+
+  /banker-acceptances/summary:
+    get:
+      tags: [Banker Acceptances]
+      summary: Outstanding BA exposure by currency, due within 7 days, overdue
+      responses:
+        "200": { description: OK }
+
+  /banker-acceptances/{id}/settle:
+    post:
+      tags: [Banker Acceptances]
+      summary: Settle a BA at maturity - debits the settlement account (requires accounts.manage)
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                settledDate: { type: string, format: date }
+                settledAmount: { type: number, description: "Defaults to the face amount" }
+      responses:
+        "200": { description: OK }
+
+  /instrument-quotas:
+    get:
+      tags: [Quotas]
+      summary: Cheque / bank draft daily quotas
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [Quotas]
+      summary: Create a quota (requires accounts.manage)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuotaInput" }
+      responses:
+        "201": { description: Created }
+
+  /instrument-quotas/usage:
+    get:
+      tags: [Quotas]
+      summary: Released / pending / remaining against each quota for a date
+      parameters: [{ in: query, name: date, schema: { type: string, format: date } }]
+      responses:
+        "200": { description: OK }
+
   /reports/cash-position:
     get:
       tags: [Reports]
@@ -353,9 +502,12 @@ components:
         currentBalance: { type: number }
         minimumBalance: { type: number }
         targetBalance: { type: number }
+        overdraftLimit: { type: number, description: "Approved overdraft; currentBalance may go negative down to -overdraftLimit" }
+        siteName: { type: string, nullable: true, description: "Site/entity for the cash-reserve view, e.g. PJRM, Bukit Raja" }
     PaymentInput:
       type: object
-      required: [beneficiaryName, beneficiaryAccount, beneficiaryBank, amount, currencyCode, sourceAccountId, paymentDate]
+      required: [beneficiaryName, amount, currencyCode, sourceAccountId, paymentDate]
+      description: beneficiaryAccount and beneficiaryBank are required when paymentMethod is TRANSFER. currencyCode must equal the source account's currency.
       properties:
         beneficiaryName: { type: string }
         beneficiaryAccount: { type: string }
@@ -363,8 +515,33 @@ components:
         amount: { type: number }
         currencyCode: { type: string }
         sourceAccountId: { type: string }
-        paymentDate: { type: string, format: date }
+        paymentDate: { type: string, format: date, description: "Due date - the day the cash leaves the account" }
+        paymentMethod: { type: string, enum: [TRANSFER, CHEQUE, BANK_DRAFT], default: TRANSFER }
+        invoiceNumber: { type: string }
         description: { type: string }
+    BankerAcceptanceInput:
+      type: object
+      required: [referenceNo, creditAccountId, faceAmount, proceedsAmount, drawdownDate, maturityDate]
+      properties:
+        referenceNo: { type: string }
+        creditAccountId: { type: string }
+        settlementAccountId: { type: string, description: "Defaults to the credited account; must be the same currency" }
+        faceAmount: { type: number, description: "Payable at maturity" }
+        proceedsAmount: { type: number, description: "Credited on drawdown; cannot exceed faceAmount" }
+        drawdownDate: { type: string, format: date }
+        maturityDate: { type: string, format: date }
+        description: { type: string }
+    QuotaInput:
+      type: object
+      required: [paymentMethod]
+      description: At least one of dailyAmountLimit / dailyCountLimit is required.
+      properties:
+        paymentMethod: { type: string, enum: [CHEQUE, BANK_DRAFT] }
+        bankId: { type: string, nullable: true, description: "null = all banks combined" }
+        dailyAmountLimit: { type: number, nullable: true }
+        dailyCountLimit: { type: integer, nullable: true }
+        currencyCode: { type: string, default: MYR }
+        isActive: { type: boolean, default: true }
     TransferInput:
       type: object
       required: [sourceAccountId, destinationAccountId, amount, currencyCode, transferDate]

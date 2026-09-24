@@ -2,6 +2,7 @@ import { prisma } from "../../common/prisma";
 import { cashPositionService } from "../cash-position/cash-position.service";
 import { forecastsService } from "../forecasts/forecasts.service";
 import { approvalsService } from "../approvals/approvals.service";
+import { todayDateOnly } from "../../common/dates";
 
 // Treasury Service: single aggregation point behind the Dashboard screen -
 // combines cash position, pipeline totals, pending approvals, recommended
@@ -15,10 +16,10 @@ export const dashboardService = {
 
     const [position, projection, pending, incomingTotals, outgoingTotals, staleAccounts, recentAuditCount, trend] = await Promise.all([
       cashPositionService.getSummary(tenantId),
-      forecastsService.getProjection(tenantId, now, in30),
+      forecastsService.getProjection(tenantId, todayDateOnly(), in30),
       approvalsService.listPending(tenantId, userRoles, parseFakeQuery()),
-      prisma.incomingTransaction.aggregate({ _sum: { amount: true }, where: { tenantId, status: "EXPECTED", valueDate: { gte: now, lte: in30 } } }),
-      prisma.payment.aggregate({ _sum: { amount: true }, where: { tenantId, status: { in: ["PENDING_APPROVAL", "APPROVED"] }, paymentDate: { gte: now, lte: in30 } } }),
+      prisma.incomingTransaction.aggregate({ _sum: { amount: true }, where: { tenantId, status: "EXPECTED", valueDate: { gte: todayDateOnly(), lte: in30 } } }),
+      prisma.payment.aggregate({ _sum: { amount: true }, where: { tenantId, status: { in: ["PENDING_APPROVAL", "APPROVED"] }, paymentDate: { gte: todayDateOnly(), lte: in30 } } }),
       prisma.bankAccount.findMany({ where: { tenantId, status: "ACTIVE", deletedAt: null, lastBalanceAt: { lt: since30 } }, select: { id: true, accountName: true, lastBalanceAt: true } }),
       prisma.auditLog.count({ where: { tenantId, createdAt: { gte: since30 } } }),
       cashPositionService.getHistory(tenantId, "daily", since30, now),

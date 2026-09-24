@@ -8,7 +8,7 @@ import { parseListQuery } from "../../common/pagination";
 import { PERMISSIONS } from "../../common/permissions";
 import { MODULE_KEYS } from "../../common/plans";
 import { incomingService } from "./incoming.service";
-import { createIncomingSchema, updateIncomingSchema } from "./incoming.schemas";
+import { createIncomingSchema, updateIncomingSchema, receiveIncomingSchema, rescheduleIncomingSchema } from "./incoming.schemas";
 
 export const incomingRouter = Router();
 incomingRouter.use(requirePermission(PERMISSIONS.INCOMING_VIEW, PERMISSIONS.INCOMING_MANAGE));
@@ -47,7 +47,15 @@ incomingRouter.patch(
 incomingRouter.post(
   "/:id/receive",
   requirePermission(PERMISSIONS.INCOMING_MANAGE),
-  asyncHandler(async (req, res) => ok(res, await incomingService.markReceived(req.user!.tenantId, req.params.id, req.user!.id)))
+  validate(receiveIncomingSchema),
+  asyncHandler(async (req, res) => ok(res, await incomingService.markReceived(req.user!.tenantId, req.params.id, req.user!.id, req.body)))
+);
+
+incomingRouter.post(
+  "/:id/reschedule",
+  requirePermission(PERMISSIONS.INCOMING_MANAGE),
+  validate(rescheduleIncomingSchema),
+  asyncHandler(async (req, res) => ok(res, await incomingService.reschedule(req.user!.tenantId, req.params.id, req.body, req.user!.id)))
 );
 
 incomingRouter.post(

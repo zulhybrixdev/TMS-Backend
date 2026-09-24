@@ -1,19 +1,40 @@
 import { z } from "zod";
 
-export const createPaymentSchema = z.object({
+// Forms send "" for a field the user left blank - treat that as "not provided".
+const blankToUndefined = (v: unknown) => (typeof v === "string" && v.trim() === "" ? undefined : v);
+
+const paymentBase = z.object({
   beneficiaryName: z.string().min(2),
-  beneficiaryAccount: z.string().min(4),
-  beneficiaryBank: z.string().min(2),
+  // Cheque / bank draft payees have no account to pay into, so these are
+  // only required for a bank TRANSFER (enforced in createPaymentSchema).
+  beneficiaryAccount: z.preprocess(blankToUndefined, z.string().min(4).optional()),
+  beneficiaryBank: z.preprocess(blankToUndefined, z.string().min(2).optional()),
   amount: z.number().positive(),
   currencyCode: z.string().length(3),
   sourceAccountId: z.string(),
+  // The AP due date: the day the cash is expected to leave the account.
   paymentDate: z.string(),
+  paymentMethod: z.enum(["TRANSFER", "CHEQUE", "BANK_DRAFT"]).default("TRANSFER"),
+  invoiceNumber: z.preprocess(blankToUndefined, z.string().max(100).optional()),
   description: z.string().optional(),
   reference: z.string().optional(),
   attachmentUrl: z.string().optional(),
 });
 
-export const updatePaymentSchema = createPaymentSchema.partial();
+export const createPaymentSchema = paymentBase.superRefine((v, ctx) => {
+  if (v.paymentMethod !== "TRANSFER") return;
+  if (!v.beneficiaryAccount) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["beneficiaryAccount"], message: "Beneficiary account number is required for a bank transfer" });
+  if (!v.beneficiaryBank) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["beneficiaryBank"], message: "Beneficiary bank is required for a bank transfer" });
+});
+
+export const updatePaymentSchema = paymentBase.partial();
+
+// Move a payment's due date without touching anything else - allowed right
+// up until the payment is actually posted (see paymentsService.reschedule).
+export const reschedulePaymentSchema = z.object({
+  paymentDate: z.string().min(8),
+  reason: z.string().max(500).optional(),
+});
 
 // Bulk payment upload: the frontend parses the uploaded CSV/XLSX into rows
 // client-side and posts them as JSON (no server-side file parsing

@@ -18,10 +18,21 @@ export interface AccountLike {
   reservedAmount: number;
   minimumBalance: number;
   targetBalance: number;
+  /** Approved overdraft facility (0 = none). Balance may go negative down to -overdraftLimit. */
+  overdraftLimit?: number;
+  /** Cheque float not yet cleared (day 1 + day 2 + later) - booked, but not usable yet. */
+  floatAmount?: number;
 }
 
 export interface AccountMetrics extends AccountLike {
+  /** Current Balance - Reserved - uncleared float. Overdraft headroom is NOT included (see liquidity). */
   availableCash: number;
+  /** Portion of the overdraft facility currently drawn (the negative part of the balance). */
+  overdraftUtilised: number;
+  /** Overdraft facility still undrawn. */
+  overdraftAvailable: number;
+  /** Everything that could be spent today: available cash plus the overdraft facility. */
+  liquidity: number;
   shortfall: number; // Required Balance - Available Cash, floored at 0
   excessCash: number; // Available Cash - Target Balance, floored at 0
   status: "SHORTFALL" | "BELOW_TARGET" | "HEALTHY" | "EXCESS";
@@ -57,19 +68,24 @@ function toNum(v: number | Decimal | string): number {
   return typeof v === "number" ? v : Number(v);
 }
 
-/** Available Cash = Current Balance - Reserved Amount */
-export function computeAvailableCash(account: Pick<AccountLike, "currentBalance" | "reservedAmount">): number {
-  return round2(toNum(account.currentBalance) - toNum(account.reservedAmount));
+/** Available Cash = Current Balance - Reserved Amount - uncleared float */
+export function computeAvailableCash(account: Pick<AccountLike, "currentBalance" | "reservedAmount" | "floatAmount">): number {
+  return round2(toNum(account.currentBalance) - toNum(account.reservedAmount) - toNum(account.floatAmount ?? 0));
+}
+
+/** Overdraft drawn = the negative part of the balance, capped only by reporting (may exceed the limit if the bank allowed it). */
+export function computeOverdraftUtilised(account: Pick<AccountLike, "currentBalance">): number {
+  return round2(Math.max(0, -toNum(account.currentBalance)));
 }
 
 /** Shortfall = Required (minimum) Balance - Available Cash, floored at 0 */
-export function computeShortfall(account: Pick<AccountLike, "currentBalance" | "reservedAmount" | "minimumBalance">): number {
+export function computeShortfall(account: Pick<AccountLike, "currentBalance" | "reservedAmount" | "minimumBalance" | "floatAmount">): number {
   const available = computeAvailableCash(account);
   return round2(Math.max(0, toNum(account.minimumBalance) - available));
 }
 
 /** Excess Cash = Available Cash - Target Balance, floored at 0 */
-export function computeExcessCash(account: Pick<AccountLike, "currentBalance" | "reservedAmount" | "targetBalance">): number {
+export function computeExcessCash(account: Pick<AccountLike, "currentBalance" | "reservedAmount" | "targetBalance" | "floatAmount">): number {
   const available = computeAvailableCash(account);
   return round2(Math.max(0, available - toNum(account.targetBalance)));
 }
@@ -78,13 +94,20 @@ export function computeAccountMetrics(account: AccountLike): AccountMetrics {
   const availableCash = computeAvailableCash(account);
   const shortfall = computeShortfall(account);
   const excessCash = computeExcessCash(account);
+  const overdraftLimit = toNum(account.overdraftLimit ?? 0);
+  const overdraftUtilised = computeOverdraftUtilised(account);
+  const overdraftAvailable = round2(Math.max(0, overdraftLimit - overdraftUtilised));
+  // A drawn overdraft is already the negative part of availableCash, so the
+  // whole facility (not just the undrawn part) is added back:
+  // e.g. balance -20k on a 100k limit -> 80k spendable.
+  const liquidity = round2(availableCash + overdraftLimit);
 
   let status: AccountMetrics["status"] = "HEALTHY";
   if (shortfall > 0) status = "SHORTFALL";
   else if (excessCash > 0) status = "EXCESS";
   else if (availableCash < toNum(account.targetBalance)) status = "BELOW_TARGET";
 
-  return { ...account, availableCash, shortfall, excessCash, status };
+  return { ...account, availableCash, overdraftUtilised, overdraftAvailable, liquidity, shortfall, excessCash, status };
 }
 
 /**
@@ -152,11 +175,14 @@ export function recommendTransfers(
  * source account so it never drops below the source's minimum balance.
  */
 export function validateTransferAmount(
-  source: Pick<AccountLike, "currentBalance" | "reservedAmount" | "minimumBalance">,
+  source: Pick<AccountLike, "currentBalance" | "reservedAmount" | "minimumBalance" | "overdraftLimit" | "floatAmount">,
   amount: number
 ): { valid: boolean; reason?: string; maxAllowed: number } {
   const available = computeAvailableCash(source);
-  const maxAllowed = round2(Math.max(0, available - toNum(source.minimumBalance)));
+  // The overdraft facility counts as spendable, so an account with one can
+  // fund a transfer by drawing on it (available already nets out anything
+  // already drawn, since that is the negative part of the balance).
+  const maxAllowed = round2(Math.max(0, available + toNum(source.overdraftLimit ?? 0) - toNum(source.minimumBalance)));
 
   if (amount <= 0) {
     return { valid: false, reason: "Transfer amount must be greater than zero.", maxAllowed };

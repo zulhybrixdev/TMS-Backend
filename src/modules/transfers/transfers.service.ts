@@ -7,6 +7,7 @@ import { getActiveAccountsWithBank, toAccountLike } from "../bank-accounts/bank-
 import { recommendTransfers, validateTransferAmount } from "../../treasury-engine/cash-engine.service";
 import { cashPositionService } from "../cash-position/cash-position.service";
 import { ParsedListQuery, buildMeta } from "../../common/pagination";
+import { floatService } from "../treasury-desk/float.service";
 
 const include = {
   sourceAccount: { include: { bank: true } },
@@ -80,10 +81,23 @@ export const transfersService = {
     if (!source) throw new NotFoundError("Source account not found");
     if (!destination) throw new NotFoundError("Destination account not found");
 
+    // One amount, one currency: the ledger posts the same figure to both
+    // legs, so both accounts must hold the transfer's currency.
+    if (source.currencyCode !== input.currencyCode || destination.currencyCode !== input.currencyCode) {
+      throw new BadRequestError(`Both accounts must be in the transfer currency (${input.currencyCode}). Source is ${source.currencyCode}, destination is ${destination.currencyCode}.`);
+    }
+
     // Prevent transfers that would push the source account below its own
     // minimum balance (business rule from the cash engine).
+    const float = await floatService.forAccount(tenantId, source.id);
     const check = validateTransferAmount(
-      { currentBalance: Number(source.currentBalance), reservedAmount: Number(source.reservedAmount), minimumBalance: Number(source.minimumBalance) },
+      {
+        currentBalance: Number(source.currentBalance),
+        reservedAmount: Number(source.reservedAmount),
+        minimumBalance: Number(source.minimumBalance),
+        overdraftLimit: Number(source.overdraftLimit),
+        floatAmount: float.total,
+      },
       input.amount
     );
     if (!check.valid) throw new BadRequestError(check.reason, { maxAllowed: check.maxAllowed });
@@ -122,8 +136,8 @@ export const transfersService = {
   async cancel(tenantId: string, id: string, actorId: string) {
     const transfer = await prisma.transfer.findFirst({ where: { id, tenantId } });
     if (!transfer) throw new NotFoundError("Transfer not found");
-    if (!["DRAFT", "PENDING_APPROVAL"].includes(transfer.status)) {
-      throw new BadRequestError("Only draft or pending transfers can be cancelled");
+    if (!["DRAFT", "PENDING_APPROVAL", "APPROVED"].includes(transfer.status)) {
+      throw new BadRequestError("Only draft, pending or approved-but-not-yet-released transfers can be cancelled");
     }
 
     await prisma.$transaction(async (tx) => {

@@ -15,8 +15,11 @@ import {
   INCOMING_COLUMNS,
   TRANSFERS_COLUMNS,
   FORECAST_COLUMNS,
+  BANKER_ACCEPTANCES_COLUMNS,
+  DAILY_MOVEMENTS_COLUMNS,
 } from "./reports.service";
 import { auditService } from "../../common/audit.service";
+import { addDays, toDateOnly, todayDateOnly } from "../../common/dates";
 
 export const reportsRouter = Router();
 reportsRouter.use(requirePermission(PERMISSIONS.REPORTS_VIEW, PERMISSIONS.REPORTS_EXPORT));
@@ -133,6 +136,41 @@ reportsRouter.get(
 );
 
 reportsRouter.get(
+  "/banker-acceptances",
+  requireModule(MODULE_KEYS.TREASURY_DESK),
+  asyncHandler(async (req, res) => {
+    const rows = await reportsService.bankerAcceptances(req.user!.tenantId);
+    if (req.query.format === "csv") {
+      await auditExport(req, "banker-acceptances");
+      return sendCsv(res, "banker-acceptances.csv", reportsService.bankerAcceptancesCsv(rows));
+    }
+    if (req.query.format === "xlsx") {
+      await auditExport(req, "banker-acceptances");
+      return sendXlsx(res, "banker-acceptances.xlsx", "Banker Acceptances", rows, BANKER_ACCEPTANCES_COLUMNS);
+    }
+    ok(res, rows);
+  })
+);
+
+reportsRouter.get(
+  "/daily-movements",
+  requireModule(MODULE_KEYS.TREASURY_DESK),
+  asyncHandler(async (req, res) => {
+    const { from, to } = dateRange(req);
+    const rows = await reportsService.dailyMovements(req.user!.tenantId, from, to);
+    if (req.query.format === "csv") {
+      await auditExport(req, "daily-movements");
+      return sendCsv(res, "daily-movements.csv", reportsService.dailyMovementsCsv(rows));
+    }
+    if (req.query.format === "xlsx") {
+      await auditExport(req, "daily-movements");
+      return sendXlsx(res, "daily-movements.xlsx", "Daily Movements", rows, DAILY_MOVEMENTS_COLUMNS);
+    }
+    ok(res, rows);
+  })
+);
+
+reportsRouter.get(
   "/cash-flow",
   asyncHandler(async (req, res) => {
     const { from, to } = dateRange(req);
@@ -143,8 +181,8 @@ reportsRouter.get(
 reportsRouter.get(
   "/forecast",
   asyncHandler(async (req, res) => {
-    const to = req.query.to ? new Date(String(req.query.to)) : new Date(Date.now() + 30 * 86400000);
-    const from = req.query.from ? new Date(String(req.query.from)) : new Date();
+    const to = req.query.to ? toDateOnly(String(req.query.to)) : addDays(todayDateOnly(), 30);
+    const from = req.query.from ? toDateOnly(String(req.query.from)) : todayDateOnly();
     const rows = await reportsService.forecast(req.user!.tenantId, from, to);
     if (req.query.format === "csv") {
       await auditExport(req, "forecast");

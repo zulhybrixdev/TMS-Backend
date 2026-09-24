@@ -3,6 +3,9 @@ import { computeAccountMetrics, recommendTransfers, DEFAULT_CASH_ENGINE_CONFIG }
 import { getActiveAccountsWithBank, toAccountLike, serializeAccount } from "../bank-accounts/bank-accounts.service";
 import { systemSettingsService, SETTING_KEYS } from "../system-settings/system-settings.service";
 import { fxService } from "../fx/fx.service";
+import { getRatesToBase } from "../fx/base-rates";
+import { toDateOnly, todayDateOnly } from "../../common/dates";
+import { dailyClosingBalances } from "../treasury-desk/balance-series";
 
 // Treasury Service: consolidated cash position. This is the shared
 // aggregation layer behind both the Dashboard and the dedicated Cash
@@ -19,15 +22,29 @@ export const cashPositionService = {
     const accounts = await getActiveAccountsWithBank(tenantId);
     const metrics = accounts.map((a) => computeAccountMetrics(toAccountLike(a)));
 
-    const totalCash = round2(metrics.reduce((s, m) => s + m.currentBalance, 0));
-    const availableCash = round2(metrics.reduce((s, m) => s + m.availableCash, 0));
-    const minimumRequired = round2(metrics.reduce((s, m) => s + m.minimumBalance, 0));
-    const targetTotal = round2(metrics.reduce((s, m) => s + m.targetBalance, 0));
-    const totalShortfall = round2(metrics.reduce((s, m) => s + m.shortfall, 0));
-    const totalExcess = round2(metrics.reduce((s, m) => s + m.excessCash, 0));
+    // Headline totals are in the tenant's base currency: adding a USD balance
+    // to a MYR one as if they were the same unit gives a meaningless number.
+    // A currency with no obtainable rate is left out of the totals and
+    // reported in unconvertedCurrencies rather than guessed. Per-currency
+    // figures (byCurrency, each account row) stay in their own currency.
+    const { base, rates, conversionEnabled } = await getRatesToBase(tenantId, metrics.map((m) => m.currencyCode));
+    const foreign = Array.from(new Set(metrics.map((m) => m.currencyCode))).filter((c) => c !== base);
+    const unconvertedCurrencies = foreign.filter((c) => rates[c] === undefined);
+    const inBase = (pick: (m: (typeof metrics)[number]) => number) => round2(metrics.reduce((s, m) => (rates[m.currencyCode] === undefined ? s : s + pick(m) * rates[m.currencyCode]!), 0));
 
-    const byBank = groupSum(metrics, (m) => m.bankName);
-    const byCurrency = groupSum(metrics, (m) => m.currencyCode);
+    const totalCash = inBase((m) => m.currentBalance);
+    const availableCash = inBase((m) => m.availableCash);
+    const minimumRequired = inBase((m) => m.minimumBalance);
+    const targetTotal = inBase((m) => m.targetBalance);
+    const totalShortfall = inBase((m) => m.shortfall);
+    const totalExcess = inBase((m) => m.excessCash);
+    const totalFloat = inBase((m) => m.floatAmount ?? 0);
+    const overdraftLimit = inBase((m) => m.overdraftLimit ?? 0);
+    const overdraftUtilised = inBase((m) => m.overdraftUtilised);
+    const liquidity = inBase((m) => m.liquidity);
+
+    const byBank = groupSum(metrics, (m) => m.bankName, (m) => (rates[m.currencyCode] === undefined ? 0 : m.currentBalance * rates[m.currencyCode]!));
+    const byCurrency = groupSum(metrics, (m) => m.currencyCode, (m) => m.currentBalance);
 
     const config = await this.getEngineConfig(tenantId);
     const recommendations = recommendTransfers(
@@ -36,6 +53,9 @@ export const cashPositionService = {
     );
 
     return {
+      baseCurrency: base,
+      fxConversion: conversionEnabled,
+      unconvertedCurrencies,
       totalCash,
       availableCash,
       minimumRequired,
@@ -43,6 +63,10 @@ export const cashPositionService = {
       excessOverTarget: round2(availableCash - targetTotal),
       totalShortfall,
       totalExcess,
+      totalFloat,
+      overdraftLimit,
+      overdraftUtilised,
+      liquidity,
       accountCount: accounts.length,
       accountsInShortfall: metrics.filter((m) => m.status === "SHORTFALL").length,
       byBank,
@@ -52,25 +76,32 @@ export const cashPositionService = {
     };
   },
 
-  // Daily/weekly/monthly historical view built from the account_balances
-  // snapshot table (populated by manual entry and by every ledger posting).
+  // Daily/weekly/monthly historical view, from the account_balances snapshots
+  // (see treasury-desk/balance-series.ts: quiet days carry the last balance
+  // forward). Company total in the base currency; a weekly/monthly point is
+  // the balance on the last day of that week/month within the range.
   async getHistory(tenantId: string, period: "daily" | "weekly" | "monthly", from: Date, to: Date) {
-    const rows = await prisma.accountBalance.findMany({
-      where: { tenantId, balanceDate: { gte: from, lte: to } },
-      include: { account: { include: { bank: true } } },
-      orderBy: { balanceDate: "asc" },
+    const fromDay = toDateOnly(from);
+    const toDay = toDateOnly(to) > todayDateOnly() ? todayDateOnly() : toDateOnly(to);
+    if (toDay < fromDay) return [];
+
+    const [{ dates, byAccount }, accounts] = await Promise.all([
+      dailyClosingBalances(tenantId, fromDay, toDay),
+      prisma.bankAccount.findMany({ where: { tenantId, deletedAt: null }, select: { id: true, currencyCode: true } }),
+    ]);
+    const { rates } = await getRatesToBase(tenantId, accounts.map((a) => a.currencyCode));
+
+    const bucketed = new Map<string, number>();
+    dates.forEach((date, i) => {
+      let total = 0;
+      for (const a of accounts) {
+        const v = byAccount.get(a.id)?.[i];
+        const rate = rates[a.currencyCode];
+        if (v != null && rate !== undefined) total += v * rate;
+      }
+      bucketed.set(bucketKey(new Date(`${date}T00:00:00Z`), period), round2(total)); // later days overwrite earlier ones: last day of the bucket wins
     });
-
-    const bucketed = new Map<string, { date: string; closingBalance: number }>();
-    for (const row of rows) {
-      const key = bucketKey(row.balanceDate, period);
-      const existing = bucketed.get(key);
-      const value = Number(row.closingBalance);
-      if (!existing) bucketed.set(key, { date: key, closingBalance: value });
-      else existing.closingBalance += value; // sum across accounts for that bucket's last known day
-    }
-
-    return Array.from(bucketed.values()).sort((a, b) => a.date.localeCompare(b.date));
+    return Array.from(bucketed.entries()).map(([date, closingBalance]) => ({ date, closingBalance })).sort((a, b) => a.date.localeCompare(b.date));
   },
 
   // Consolidated, FX-converted total - Pro+ only (MODULE_KEYS.ADVANCED_INSIGHTS,
@@ -116,10 +147,10 @@ function round2(n: number) {
   return Math.round(n * 100) / 100;
 }
 
-function groupSum<T extends { currentBalance: number }>(rows: T[], keyFn: (r: T) => string) {
+function groupSum<T>(rows: T[], keyFn: (r: T) => string, valueFn: (r: T) => number) {
   const map = new Map<string, number>();
   for (const r of rows) {
-    map.set(keyFn(r), round2((map.get(keyFn(r)) ?? 0) + r.currentBalance));
+    map.set(keyFn(r), round2((map.get(keyFn(r)) ?? 0) + valueFn(r)));
   }
   return Array.from(map.entries()).map(([key, total]) => ({ key, total }));
 }
