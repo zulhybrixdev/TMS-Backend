@@ -44,6 +44,9 @@ import { notificationsRouter } from "./modules/notifications/notifications.route
 import { currenciesRouter } from "./modules/currencies/currencies.routes";
 import { fxRouter } from "./modules/fx/fx.routes";
 import { auditLogsRouter } from "./modules/audit-logs/audit-logs.routes";
+import { announcementsPublicRouter } from "./modules/announcements/announcements.routes";
+import { announcementsService } from "./modules/announcements/announcements.service";
+import { maintenanceGuard } from "./common/middleware/maintenance.middleware";
 import { treasuryDeskRouter } from "./modules/treasury-desk/treasury-desk.routes";
 import { bankerAcceptancesRouter } from "./modules/banker-acceptances/banker-acceptances.routes";
 import { instrumentQuotasRouter } from "./modules/instrument-quotas/instrument-quotas.routes";
@@ -84,9 +87,13 @@ try {
 // Public: login/register live here, plus the Fiuu (or dummy) payment
 // gateway callbacks, which authenticate themselves via a signed payload
 // instead of a bearer token. Everything else under /api requires one.
+// While a maintenance/downtime lock is live, refuse tenant requests (see maintenance.middleware.ts).
+app.use("/api", maintenanceGuard);
+
 app.use("/api/auth", authRouter);
 app.use("/api/auth/sso", ssoRouter);
 app.use("/api/billing", billingRouter);
+app.use("/api/announcements", announcementsPublicRouter); // public: also shown on the sign-in page
 
 // Platform admin: a separate account type, never a tenant's own User, with
 // its own token scope - mounted before the tenant `authenticate` below so
@@ -212,6 +219,8 @@ setInterval(() => {
 // caveat as the sweeps above.
 const runScheduledRelease = async () => {
   try {
+    // Nothing is posted while the system is locked for maintenance; anything due is released by the next run after it lifts.
+    if (await announcementsService.getActiveLock()) return;
     await releaseDueApprovedPayments();
     await releaseDueApprovedTransfers();
   } catch (err) {

@@ -1,3 +1,5 @@
+import { platformConfigService } from "../../common/platform-config.service";
+import { requireRegistrationOpen } from "../../common/middleware/registration.middleware";
 import { Router } from "express";
 import { asyncHandler } from "../../common/async-handler";
 import { created, ok } from "../../common/response";
@@ -21,9 +23,17 @@ authRouter.post(
   })
 );
 
+// Public: lets the login/registration pages know whether sign-up is open, so
+// they can hide the "create an organisation" link and show a closed notice.
+authRouter.get(
+  "/registration-status",
+  asyncHandler(async (_req, res) => ok(res, { open: await platformConfigService.isRegistrationEnabled() }))
+);
+
 authRouter.post(
   "/register",
   authLimiter,
+  asyncHandler(requireRegistrationOpen),
   validate(registerSchema),
   asyncHandler(async (req, res) => {
     const result = await authService.register(req.body, req.ip);

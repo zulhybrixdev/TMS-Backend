@@ -32,4 +32,11 @@ export const registerSchema = z.object({
   email: z.string().email(),
   password: z.string().min(8, "Password must be at least 8 characters"),
   jobTitle: z.string().optional(),
+  // Must be an explicit `true` - a missing or false value is refused, so the
+  // API can't be used to register without accepting. The versions are the
+  // documents the person actually saw (checked against the current ones).
+  acceptTerms: z.literal(true, { errorMap: () => ({ message: "You must accept the Terms and Conditions to register" }) }),
+  acceptPrivacy: z.literal(true, { errorMap: () => ({ message: "You must accept the Privacy Policy to register" }) }),
+  termsVersion: z.string().min(1, "Terms version is required"),
+  privacyVersion: z.string().min(1, "Privacy Policy version is required"),
 });

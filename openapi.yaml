@@ -53,6 +53,33 @@ paths:
                   - $ref: "#/components/schemas/ApiResponse"
         "401": { description: Invalid credentials }
 
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Self-service registration (creates a tenant and its Admin)
+      description: >
+        Requires acceptTerms and acceptPrivacy to be true and the current termsVersion / privacyVersion
+        (409 if stale). Answers 403 REGISTRATION_CLOSED while registration is closed on this environment.
+      responses:
+        "201": { description: Created }
+        "403": { description: Registration closed }
+
+  /auth/registration-status:
+    get:
+      tags: [Auth]
+      security: []
+      summary: Whether self-service registration is currently open (public)
+      responses:
+        "200": { description: "{ open: boolean }" }
+
+  /announcements/active:
+    get:
+      tags: [Auth]
+      security: []
+      summary: Announcements live right now (public - shown on the sign-in page too)
+      responses:
+        "200": { description: "Array of { id, type, titleEn, titleMs, messageEn, messageMs, startsAt, endsAt, affectedFrom, affectedTo, persistent, blocking, locked, lockedUntil }, most severe first. While any entry has locked=true every other tenant endpoint answers 503 MAINTENANCE_MODE (Platform Console, billing callbacks, registration-status, meta, docs and impersonation sessions excepted)" }
+
   /auth/me:
     get:
       tags: [Auth]

@@ -11,6 +11,10 @@ export const setTenantSubscriptionSchema = z.object({
   status: z.enum(["ACTIVE", "PAST_DUE", "CANCELED", "PENDING_PAYMENT"]).optional(),
 });
 
+export const setRegistrationSchema = z.object({
+  enabled: z.boolean(),
+});
+
 export const setPocModeSchema = z.object({
   pocMode: z.boolean(),
 });

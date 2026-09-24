@@ -6,8 +6,10 @@ import { authenticatePlatform } from "../../common/middleware/platform-auth.midd
 import { parseListQuery } from "../../common/pagination";
 import { platformConfigService } from "../../common/platform-config.service";
 import { platformService } from "./platform.service";
+import { announcementsService } from "../announcements/announcements.service";
+import { createAnnouncementSchema, updateAnnouncementSchema } from "../announcements/announcements.schemas";
 import { keycloakService, createIdpSchema, tenantSsoSchema } from "./keycloak.service";
-import { platformLoginSchema, setTenantSubscriptionSchema, setPocModeSchema } from "./platform.schemas";
+import { platformLoginSchema, setTenantSubscriptionSchema, setPocModeSchema, setRegistrationSchema } from "./platform.schemas";
 
 // Public: platform-admin login only. Everything else requires the
 // platform-scoped bearer token (see index.ts route mounting).
@@ -35,12 +37,35 @@ platformRouter.use(authenticatePlatform);
 // DB-driven POC/full mode switch - see poc-mode.middleware.ts. Flipping
 // this redirects the live site between /poc and the full app within
 // seconds, no rebuild or redeploy.
-platformRouter.get("/config", asyncHandler(async (_req, res) => ok(res, { pocMode: await platformConfigService.getPocMode() })));
+platformRouter.get("/config", asyncHandler(async (_req, res) => ok(res, await platformConfigService.get())));
 platformRouter.post(
   "/config",
   validate(setPocModeSchema),
-  asyncHandler(async (req, res) => ok(res, { pocMode: await platformConfigService.setPocMode(req.body.pocMode) }))
+  asyncHandler(async (req, res) => ok(res, await platformConfigService.setPocMode(req.body.pocMode)))
 );
+
+// Open / close self-service registration for THIS environment (each
+// environment - dev, uat, production - has its own row in its own database,
+// which is why Platform Console flips them one by one). Closing it stops new
+// individuals and companies from signing up; existing tenants and users carry
+// on as normal. Logged like the other platform actions.
+platformRouter.post(
+  "/config/registration",
+  validate(setRegistrationSchema),
+  asyncHandler(async (req, res) => {
+    const before = await platformConfigService.isRegistrationEnabled();
+    const config = await platformConfigService.setRegistrationEnabled(req.body.enabled);
+    console.info("[platform-audit]", JSON.stringify({ at: new Date().toISOString(), action: "platform.registration.set", platformAdminId: req.platformAdmin!.id, from: before, to: config.registrationEnabled }));
+    ok(res, config);
+  })
+);
+
+// Announcements shown to every user of this environment (see modules/announcements).
+platformRouter.get("/announcements", asyncHandler(async (_req, res) => ok(res, await announcementsService.listAll())));
+platformRouter.post("/announcements", validate(createAnnouncementSchema), asyncHandler(async (req, res) => ok(res, await announcementsService.create(req.body, req.platformAdmin!.id))));
+platformRouter.put("/announcements/:id", validate(updateAnnouncementSchema), asyncHandler(async (req, res) => ok(res, await announcementsService.update(req.params.id, req.body, req.platformAdmin!.id))));
+platformRouter.post("/announcements/:id/end", asyncHandler(async (req, res) => ok(res, await announcementsService.endNow(req.params.id, req.platformAdmin!.id))));
+platformRouter.delete("/announcements/:id", asyncHandler(async (req, res) => ok(res, await announcementsService.remove(req.params.id, req.platformAdmin!.id))));
 
 platformRouter.get("/tenants", asyncHandler(async (_req, res) => ok(res, await platformService.listTenants())));
 platformRouter.get("/tenants/:id", asyncHandler(async (req, res) => ok(res, await platformService.getTenant(req.params.id))));

@@ -26,6 +26,11 @@ datasource db {
 model PlatformConfig {
   id        String   @id @default("singleton")
   pocMode   Boolean  @default(false) @map("poc_mode")
+  // Self-service registration (POST /auth/register) - new individuals and
+  // companies. Turned off from Platform Console, per environment, e.g. during
+  // housekeeping so no new tenants or users appear. Existing tenants and users
+  // are unaffected. Default true = open, as it always was.
+  registrationEnabled Boolean @default(true) @map("registration_enabled")
   updatedAt DateTime @updatedAt @map("updated_at")
 
   @@map("platform_config")
@@ -223,6 +228,19 @@ model User {
   // returned in plaintext once setup is confirmed.
   totpSecret       String?    @map("totp_secret")
   totpEnabled      Boolean    @default(false) @map("totp_enabled")
+
+  // Legal acceptance captured at self-service registration (see
+  // common/legal.ts for the current document versions). The booleans are the
+  // quick "has this person accepted?" flag; the timestamp and version say
+  // exactly what they accepted and when. Users who did not register
+  // themselves (invited by an admin, SSO-provisioned, seeded) stay at false /
+  // null - this records consent given, it does not enforce it on them.
+  termsAccepted     Boolean   @default(false) @map("terms_accepted")
+  termsAcceptedAt   DateTime? @map("terms_accepted_at")
+  termsVersion      String?   @map("terms_version") @db.VarChar(32)
+  privacyAccepted   Boolean   @default(false) @map("privacy_accepted")
+  privacyAcceptedAt DateTime? @map("privacy_accepted_at")
+  privacyVersion    String?   @map("privacy_version") @db.VarChar(32)
 
   tenant             Tenant             @relation(fields: [tenantId], references: [id])
   roles              UserRole[]
@@ -1079,6 +1097,48 @@ model InstrumentQuota {
   @@index([tenantId])
   @@index([bankId])
   @@map("instrument_quotas")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Announcements (platform-wide notices: maintenance, downtime, news)
+// ─────────────────────────────────────────────────────────────
+
+// Written in Platform Console and shown to every user of THIS environment as a
+// banner (signed in, and on the sign-in page) between startsAt and endsAt.
+// Not tenant-scoped, like PlatformConfig. persistent = the user cannot dismiss
+// it (typically downtime); otherwise they can close it. Each environment has
+// its own database, so Platform Console creates one row per chosen environment.
+model Announcement {
+  id           String           @id @default(cuid())
+  type         AnnouncementType @default(INFO)
+  titleEn      String           @map("title_en") @db.VarChar(160)
+  titleMs      String?          @map("title_ms") @db.VarChar(160)
+  messageEn    String           @map("message_en") @db.Text
+  messageMs    String?          @map("message_ms") @db.Text
+  startsAt     DateTime         @map("starts_at")
+  endsAt       DateTime         @map("ends_at")
+  // The actual maintenance / outage window, shown in the banner (optional).
+  affectedFrom DateTime?        @map("affected_from")
+  affectedTo   DateTime?        @map("affected_to")
+  persistent   Boolean          @default(false)
+  // Lock the system while it is in progress: a full-screen notice replaces the
+  // app and the API refuses tenant requests (platform staff and payment-gateway
+  // callbacks excepted) until the window ends or the announcement is ended /
+  // deleted. The lock window is affectedFrom..affectedTo when set, otherwise
+  // startsAt..endsAt. Only meaningful for MAINTENANCE and DOWNTIME.
+  blocking     Boolean          @default(false)
+  createdById  String?          @map("created_by_id")
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+
+  @@index([startsAt, endsAt])
+  @@map("announcements")
+}
+
+enum AnnouncementType {
+  INFO
+  MAINTENANCE
+  DOWNTIME
 }
 
 // ─────────────────────────────────────────────────────────────

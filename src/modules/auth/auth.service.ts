@@ -1,8 +1,10 @@
+import { LEGAL_VERSIONS } from "../../common/legal";
+import { platformConfigService } from "../../common/platform-config.service";
 import bcrypt from "bcryptjs";
 import { TenantAccountType } from "@prisma/client";
 import { prisma } from "../../common/prisma";
 import { env } from "../../config/env";
-import { BadRequestError, ConflictError, TenantSuspendedError, UnauthorizedError } from "../../common/errors";
+import { AppError, BadRequestError, ConflictError, TenantSuspendedError, UnauthorizedError } from "../../common/errors";
 import { auditService } from "../../common/audit.service";
 import { loadAuthUser, signTenantToken, signMfaChallengeToken, signMfaEnrollmentToken } from "../../common/auth-token";
 import { MODULE_KEYS, PLAN_KEYS, PlanKeyValue, planIncludesModule } from "../../common/plans";
@@ -11,6 +13,10 @@ import { generateUniqueTenantSlug, provisionTenant } from "../../common/tenant-p
 import { billingService } from "../billing/billing.service";
 
 export interface RegisterInput {
+  acceptTerms: true;
+  acceptPrivacy: true;
+  termsVersion: string;
+  privacyVersion: string;
   companyName: string;
   accountType: TenantAccountType;
   planKey: PlanKeyValue;
@@ -86,11 +92,23 @@ export const authService = {
   // immediately; Pro/Pro+ come back with a checkoutUrl for the frontend to
   // redirect to (real Fiuu or the dummy simulator - see billing module).
   async register(input: RegisterInput, ipAddress?: string) {
+    // Also enforced here (not only in the route middleware) so no other caller can bypass it.
+    if (!(await platformConfigService.isRegistrationEnabled())) {
+      throw new AppError(403, "REGISTRATION_CLOSED", "New registrations are currently closed. Please try again later, or contact your administrator.");
+    }
+    // The person must have accepted the *current* documents. A version
+    // mismatch means the text changed after they loaded the form (or the
+    // client is stale), so they have to read it again before accepting.
+    if (input.termsVersion !== LEGAL_VERSIONS.terms || input.privacyVersion !== LEGAL_VERSIONS.privacy) {
+      throw new ConflictError("The Terms and Conditions or Privacy Policy have been updated. Please reload the page and review them again before registering.");
+    }
+
     const existingEmail = await prisma.user.findUnique({ where: { email: input.email } });
     if (existingEmail) throw new ConflictError("A user with this email already exists");
 
     const slug = await generateUniqueTenantSlug(input.companyName);
     const passwordHash = await bcrypt.hash(input.password, env.bcryptSaltRounds);
+    const acceptedAt = new Date();
 
     const { user, tenantId } = await prisma.$transaction(async (tx) => {
       const { tenant, roleIdByName, subscription } = await provisionTenant(tx, {
@@ -108,6 +126,12 @@ export const authService = {
           name: input.name,
           jobTitle: input.jobTitle,
           passwordHash,
+          termsAccepted: true,
+          termsAcceptedAt: acceptedAt,
+          termsVersion: LEGAL_VERSIONS.terms,
+          privacyAccepted: true,
+          privacyAcceptedAt: acceptedAt,
+          privacyVersion: LEGAL_VERSIONS.privacy,
           roles: { create: [{ roleId: adminRoleId }] },
         },
       });
@@ -115,7 +139,7 @@ export const authService = {
       return { user: createdUser, tenantId: tenant.id, subscriptionId: subscription.id };
     });
 
-    await auditService.record({ tenantId, actorId: user.id, action: "auth.register", entityType: "Tenant", entityId: tenantId, ipAddress });
+    await auditService.record({ tenantId, actorId: user.id, action: "auth.register", entityType: "Tenant", entityId: tenantId, ipAddress, afterState: { termsVersion: LEGAL_VERSIONS.terms, privacyVersion: LEGAL_VERSIONS.privacy, acceptedAt } });
 
     const authUser = await loadAuthUser(user.id);
     const token = signTenantToken(authUser);
